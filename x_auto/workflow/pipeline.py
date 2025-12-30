@@ -1,0 +1,119 @@
+"""
+High-level automation pipeline:
+(1) fetch posts → (2) keyword match → (3) score → (4) generate reply
+→ (5) send to X → (6) log results.
+
+This module wires together the major components while leaving detailed
+utilities (ID tracking, logging formatting, human approval) as stubs.
+"""
+
+from __future__ import annotations
+
+import os
+from typing import Any, Dict, List
+
+from scrapers.apify_client import fetch_posts
+
+from x_auto.matcher.keyword_matcher import match_keywords, score_matches
+from x_auto.reply_engine.reply_generator import build_reply_text, select_best_template
+from x_auto.sheets.client import GoogleSheetsClient
+from x_auto.x_api.x_client import post_reply
+
+
+def run_pipeline() -> None:
+    """
+    Execute the end-to-end workflow using Sheets data, Apify scraper, and X API.
+
+    Steps:
+        1) Load profile handles and keyword/template rows from Google Sheets.
+        2) Fetch recent posts for each handle via Apify.
+        3) Filter out posts that have already been processed (placeholder utility).
+        4) Perform keyword matching and compute scores.
+        5) Choose the best template and generate a reply (delegated to reply_engine).
+        6) Optionally request human approval (placeholder utility).
+        7) Post the reply to X.
+        8) Log the interaction back to Google Sheets.
+
+    Note:
+        This function focuses on orchestration; several utilities are intentionally
+        left as stubs for future implementation.
+    """
+    spreadsheet_name = os.getenv("GOOGLE_SPREADSHEET_NAME", "Automation Config")
+    sheet_client = GoogleSheetsClient(spreadsheet_name=spreadsheet_name)
+    enable_posting = os.getenv("ENABLE_X_POSTING", "false").lower() == "true"
+
+    profile_rows = sheet_client.read_records("profiles")
+    keyword_rows = sheet_client.read_records("keywords")
+    template_rows = sheet_client.read_records("templates")
+
+    for profile in profile_rows:
+        profile_url = profile.get("profile_url") or profile.get("x_profile_url") or ""
+        if not profile_url:
+            continue
+
+        raw_posts = fetch_posts([profile_url], results_limit=20)
+        new_posts = filter_already_processed(raw_posts)
+
+        for post in new_posts:
+            text = post.get("text", "")
+            matches = match_keywords(text, keyword_rows)
+            score = score_matches(matches, post_metadata=post)
+
+            template = select_best_template(matches, template_rows)
+            reply_text = build_reply_text(template, post, matches)
+
+            if requires_human_approval(post, reply_text):
+                # Placeholder: route to human review (Slack/Telegram/Sheets).
+                continue
+
+            if not enable_posting:
+                # Skip posting when disabled.
+                continue
+
+            response = post_reply(text=reply_text, in_reply_to_post_id=post.get("id", ""))
+            log_row = format_log_row(post, reply_text, response)
+            sheet_client.append_row("logs", log_row)
+
+
+# Placeholder utilities with docstrings for future implementation ----------------
+
+def filter_already_processed(posts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Placeholder for ID tracking to skip posts that were already handled.
+
+    Args:
+        posts: Raw posts returned by Apify.
+
+    Returns:
+        A filtered list containing only new/unprocessed posts.
+    """
+    raise NotImplementedError("Implement ID tracking to filter already processed posts.")
+
+
+def format_log_row(post: Dict[str, Any], reply_text: str, response: Dict[str, Any]) -> List[Any]:
+    """
+    Placeholder for transforming an interaction into a log row for Sheets.
+
+    Args:
+        post: The source post dictionary.
+        reply_text: Text sent to X.
+        response: API response from X after posting.
+
+    Returns:
+        A sequence of values suitable for appending to a Google Sheet row.
+    """
+    raise NotImplementedError("Implement log formatting for Google Sheets.")
+
+
+def requires_human_approval(post: Dict[str, Any], reply_text: str) -> bool:
+    """
+    Placeholder for deciding whether a reply should be routed to human approval.
+
+    Args:
+        post: The source post dictionary.
+        reply_text: Generated reply text.
+
+    Returns:
+        True if human approval is required, otherwise False.
+    """
+    raise NotImplementedError("Implement human approval decision logic.")

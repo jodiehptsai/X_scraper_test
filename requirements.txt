@@ -1,0 +1,8 @@
+google-api-python-client
+google-auth
+gspread
+requests
+python-dotenv
+oauthlib
+requests-oauthlib
+schedule
