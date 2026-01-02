@@ -100,15 +100,23 @@ def get_profile_urls(sheet_client: GoogleSheetsClient, sheet_name: str = "profil
     try:
         records = worksheet.get_all_records()
         for row in records:
-            handle = row.get("X(handle)") or row.get("X handle") or row.get("handle")
+            handle = row.get("X(handle)") or row.get("X handle") or row.get("handle") or row.get("Handle")
             link = row.get("X(link)") or row.get("X link") or row.get("link")
-            handle = (handle or "").strip().lstrip("@")
+            handle_str = (handle or "").strip()
             link = (link or "").strip()
 
             if link:
                 urls.extend(normalize_links(link))
-            if handle:
-                urls.append(f"https://x.com/{handle}")
+            if handle_str:
+                # Split multiple handles by newlines, commas, spaces, pipes, or slashes
+                handle_parts = re.split(r'[\n,|/]+', handle_str)
+                for h in handle_parts:
+                    # Clean each handle: remove @, whitespace, and parenthetical notes
+                    h = h.strip().lstrip("@")
+                    # Remove anything in parentheses (e.g., "(founder)")
+                    h = re.sub(r'\s*\([^)]*\)\s*', '', h).strip()
+                    if h and h.lower() not in {"n/a", "na"}:
+                        urls.append(f"https://x.com/{h}")
     except Exception:
         records = None
 
