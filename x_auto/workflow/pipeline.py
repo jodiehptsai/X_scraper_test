@@ -77,17 +77,52 @@ def run_pipeline() -> None:
 
 # Placeholder utilities with docstrings for future implementation ----------------
 
-def filter_already_processed(posts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def filter_already_processed(
+    posts: List[Dict[str, Any]],
+    sheet_client: GoogleSheetsClient | None = None,
+    output_sheet_name: str | None = None
+) -> List[Dict[str, Any]]:
     """
-    Placeholder for ID tracking to skip posts that were already handled.
+    Filter out posts that have already been processed by checking the output sheet.
 
     Args:
         posts: Raw posts returned by Apify.
+        sheet_client: Optional GoogleSheetsClient instance. If None, creates a new one.
+        output_sheet_name: Optional worksheet name. If None, uses GOOGLE_X_SCRAPE_OUTPUT_WORKSHEET.
 
     Returns:
         A filtered list containing only new/unprocessed posts.
     """
-    raise NotImplementedError("Implement ID tracking to filter already processed posts.")
+    if not posts:
+        return []
+
+    # Get or create sheet client
+    if sheet_client is None:
+        output_sheet_id = os.getenv("GOOGLE_X_SCRAPE_OUTPUT")
+        if not output_sheet_id:
+            # If no output sheet configured, return all posts (no filtering)
+            return posts
+        sheet_client = GoogleSheetsClient(
+            spreadsheet_name="Scrape Output",
+            spreadsheet_id=output_sheet_id
+        )
+
+    # Get worksheet name
+    if output_sheet_name is None:
+        output_sheet_name = os.getenv("GOOGLE_X_SCRAPE_OUTPUT_WORKSHEET", "scraped_output")
+
+    # Fetch existing post IDs from the output sheet
+    try:
+        existing_records = sheet_client.read_records(output_sheet_name)
+        existing_post_ids = {record.get("post_id", "") for record in existing_records if record.get("post_id")}
+    except Exception:
+        # If sheet doesn't exist or is empty, assume no posts have been processed
+        existing_post_ids = set()
+
+    # Filter posts
+    new_posts = [post for post in posts if post.get("id", "") not in existing_post_ids]
+
+    return new_posts
 
 
 def format_log_row(post: Dict[str, Any], reply_text: str, response: Dict[str, Any]) -> List[Any]:

@@ -159,3 +159,80 @@ def write_review_queue(sheet_client: GoogleSheetsClient, sheet_name: str, rows: 
     Placeholder for writing review queue entries; to be implemented with project-specific parsing.
     """
     raise NotImplementedError("Review queue writing is not yet implemented.")
+
+
+def write_scraped_posts(
+    sheet_client: GoogleSheetsClient,
+    sheet_name: str,
+    posts: List[Dict[str, Any]],
+    ensure_headers: bool = True
+) -> int:
+    """
+    Write scraped posts to a Google Sheet with proper column formatting.
+
+    Args:
+        sheet_client: Authenticated GoogleSheetsClient instance.
+        sheet_name: Name of the worksheet to write to.
+        posts: List of post dictionaries from Apify scraper.
+        ensure_headers: If True, adds headers if the sheet is empty.
+
+    Returns:
+        Number of posts written to the sheet.
+
+    Raises:
+        RuntimeError: If the worksheet cannot be accessed.
+
+    Column structure:
+        post_id, author_username, author_name, text, created_at,
+        url, likes, retweets, replies, views, scraped_at
+    """
+    if not posts:
+        return 0
+
+    worksheet = sheet_client.get_sheet(sheet_name)
+
+    # Check if we need to add headers
+    if ensure_headers:
+        try:
+            existing_data = worksheet.get_all_values()
+            if not existing_data or not existing_data[0]:
+                # Sheet is empty, add headers
+                headers = [
+                    "post_id", "author_username", "author_name", "text",
+                    "created_at", "url", "likes", "retweets", "replies",
+                    "views", "scraped_at"
+                ]
+                worksheet.append_row(headers, value_input_option="USER_ENTERED")
+        except Exception as e:
+            raise RuntimeError(f"Failed to check/add headers: {e}")
+
+    # Prepare rows from posts
+    from datetime import datetime
+    scraped_at = datetime.now().isoformat()
+
+    rows_to_add = []
+    for post in posts:
+        author = post.get("author", {})
+        row = [
+            post.get("id", ""),
+            author.get("userName", ""),
+            author.get("name", ""),
+            post.get("text", ""),
+            post.get("createdAt", ""),
+            post.get("url", ""),
+            post.get("likes", 0),
+            post.get("retweetCount", 0),
+            post.get("replyCount", 0),
+            post.get("viewCount", 0),
+            scraped_at
+        ]
+        rows_to_add.append(row)
+
+    # Batch write all rows
+    if rows_to_add:
+        try:
+            worksheet.append_rows(rows_to_add, value_input_option="USER_ENTERED")
+        except Exception as e:
+            raise RuntimeError(f"Failed to write posts to sheet: {e}")
+
+    return len(rows_to_add)

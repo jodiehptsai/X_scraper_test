@@ -29,10 +29,16 @@ from x_auto.sheets.client import GoogleSheetsClient
 
 def load_env() -> None:
     """Load environment variables from .env if present."""
-    if os.path.isfile(".env"):
-        load_dotenv(".env")
-    elif os.path.isfile(".env.example"):
-        load_dotenv(".env.example")
+    # Get the project root directory (two levels up from this file)
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    project_root = os.path.dirname(os.path.dirname(current_dir))
+    env_path = os.path.join(project_root, ".env")
+    env_example_path = os.path.join(project_root, ".env.example")
+
+    if os.path.isfile(env_path):
+        load_dotenv(env_path, override=True)
+    elif os.path.isfile(env_example_path):
+        load_dotenv(env_example_path, override=True)
 
 
 def get_profile_urls(sheet_client: GoogleSheetsClient, sheet_name: str = "profiles") -> List[str]:
@@ -255,7 +261,7 @@ def get_prompt(sheet_client: GoogleSheetsClient, sheet_name: str = "prompts") ->
 def call_chatgpt(
     prompt: str,
     content: str,
-    model: str = "gpt-4o-mini",
+    model: str = "gpt-5.2",
     max_tokens: int = 50,
 ) -> str:
     """
@@ -277,17 +283,31 @@ def call_chatgpt(
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY is required for ChatGPT calls.")
 
-    body = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": prompt},
-            {"role": "user", "content": content},
-        ],
-        "max_tokens": max_tokens,
-    }
+    # Strip whitespace and ensure proper encoding
+    api_key = api_key.strip()
+
+    # GPT-5.x models use max_completion_tokens instead of max_tokens
+    if model.startswith("gpt-5"):
+        body = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": content},
+            ],
+            "max_completion_tokens": max_tokens,
+        }
+    else:
+        body = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": content},
+            ],
+            "max_tokens": max_tokens,
+        }
     headers = {
         "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
+        "Content-Type": "application/json; charset=utf-8",
     }
     resp = requests.post("https://api.openai.com/v1/chat/completions", json=body, headers=headers, timeout=30)
     if not resp.ok:
@@ -311,6 +331,42 @@ def is_match_via_llm(prompt: str, post_text: str) -> bool:
     return "yes" in reply.lower()
 
 
+def get_llm_decision_with_reason(prompt: str, post_text: str) -> Dict[str, Any]:
+    """
+    Get both decision and reason from LLM in a single call.
+
+    Args:
+        prompt: Decision prompt.
+        post_text: Text of the post.
+
+    Returns:
+        Dict with 'decision' (bool), 'decision_text' (str), and 'reason' (str).
+    """
+    enhanced_prompt = (
+        f"{prompt}\n\n"
+        "After your yes/no decision, provide a brief reason (1 sentence) for your decision. "
+        "Format: 'yes' or 'no', then reason on next line."
+    )
+
+    try:
+        reply = call_chatgpt(enhanced_prompt, post_text, model="gpt-5.2", max_tokens=80)
+        lines = reply.strip().split('\n', 1)
+        decision_text = lines[0].strip().lower()
+        reason = lines[1].strip() if len(lines) > 1 else "No reason provided"
+
+        return {
+            "decision": "yes" in decision_text,
+            "decision_text": "yes" if "yes" in decision_text else "no",
+            "reason": reason
+        }
+    except Exception as e:
+        return {
+            "decision": False,
+            "decision_text": "error",
+            "reason": f"Error getting LLM decision: {str(e)}"
+        }
+
+
 def generate_reply_recommendation(post_text: str, prompt: str) -> str:
     """
     Produce a concise, humanized reply recommendation for a given post.
@@ -323,7 +379,7 @@ def generate_reply_recommendation(post_text: str, prompt: str) -> str:
         A short recommendation string suitable as a draft reply.
     """
     try:
-        recommendation = call_chatgpt(prompt, post_text, model="gpt-4o-mini", max_tokens=120)
+        recommendation = call_chatgpt(prompt, post_text, model="gpt-5.2", max_tokens=120)
         return recommendation.strip()
     except Exception:
         return "No recommendation generated."
@@ -388,12 +444,126 @@ def get_prompts_from_sheet() -> Dict[str, str]:
 
 def format_timestamp(ts: Any) -> str:
     """
-    Convert a millisecond timestamp to an ISO8601 string (UTC).
+    Convert a millisecond timestamp to a human-readable string.
+    Format: "YYYY-MM-DD HH:MM AM/PM"
     """
     try:
-        return datetime.fromtimestamp(int(ts) / 1000, tz=timezone.utc).isoformat()
+        dt = datetime.fromtimestamp(int(ts) / 1000, tz=timezone.utc)
+        return dt.strftime("%Y-%m-%d %I:%M %p")
     except Exception:
         return ""
+
+
+def write_all_posts_to_testing_sheet(all_posts_data: List[Dict[str, Any]]) -> int:
+    """
+    Write ALL scraped posts (including filtered out ones) to testing sheet for analysis.
+
+    Args:
+        all_posts_data: List of post dictionaries with LLM decisions
+
+    Returns:
+        Number of rows written
+    """
+    if not all_posts_data:
+        return 0
+
+    testing_sheet_id = os.getenv("GOOGLE_X_TESTING_SHEET_ID")
+    testing_ws_name = os.getenv("GOOGLE_X_TESTING_WORKSHEET", "all-point")
+
+    if not testing_sheet_id:
+        print("GOOGLE_X_TESTING_SHEET_ID not configured, skipping testing sheet write")
+        return 0
+
+    try:
+        testing_client = GoogleSheetsClient(
+            spreadsheet_name="Testing Sheet",
+            spreadsheet_id=testing_sheet_id,
+        )
+
+        # Try to get worksheet, create if doesn't exist
+        try:
+            ws = testing_client.get_sheet(testing_ws_name)
+        except Exception:
+            print(f"Worksheet '{testing_ws_name}' not found, creating it...")
+            ws = testing_client.spreadsheet.add_worksheet(title=testing_ws_name, rows=1000, cols=20)
+            print(f"Created worksheet '{testing_ws_name}'")
+
+        existing = ws.get_all_values()
+
+        # Add headers if sheet is empty
+        if not any(cell for r in existing for cell in r):
+            headers = [
+                "scraped_at", "profile_url", "author", "post_content", "timestamp",
+                "likes", "reposts", "replies", "bookmarks", "views",
+                "llm_decision", "llm_reason", "prompt_used",
+                "reply_recommendation", "post_link"
+            ]
+            ws.append_row(headers, value_input_option="USER_ENTERED")
+            existing = ws.get_all_values()
+
+        # Build deduplication set
+        existing_keys = set()
+        for row in existing[1:]:
+            if len(row) >= 4:  # profile_url, author, post_content, timestamp
+                key = (row[1].strip(), row[2].strip(), row[3].strip())
+                existing_keys.add(key)
+
+        # Prepare rows
+        rows = []
+        scraped_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %I:%M %p")
+
+        for item in all_posts_data:
+            post = item["post"]
+            profile_url = (item.get("profile_url") or "").strip()
+            text = (post.get("text") or post.get("postText") or "").replace("\n", " ").strip()
+            author = post.get("author", {}).get("userName", "")
+
+            # Check for duplicates
+            key = (profile_url, author, text)
+            if key in existing_keys:
+                continue
+
+            ts_raw = item.get("timestamp") or post.get("timestamp") or ""
+            ts_human = format_timestamp(ts_raw)
+            post_id = item.get("post_id", "") or post.get("id", "") or post.get("postId", "")
+            post_link = (
+                post.get("postUrl")
+                or post.get("url")
+                or (f"https://x.com/i/web/status/{post_id}" if post_id else "")
+            )
+
+            # Engagement metrics
+            likes = post.get("likes", 0)
+            reposts = post.get("retweetCount", 0)
+            replies_count = post.get("replyCount", 0)
+            bookmarks = post.get("bookmarkCount", 0)
+            views = post.get("viewCount", 0)
+
+            # LLM decision data
+            llm_decision = item.get("llm_decision", "")
+            llm_reason = item.get("llm_reason", "")
+            prompt_used = item.get("prompt_used", "match_prompt")
+            reply_reco = item.get("reply_reco", "")
+
+            rows.append([
+                scraped_at, profile_url, author, text, ts_human,
+                likes, reposts, replies_count, bookmarks, views,
+                llm_decision, llm_reason, prompt_used,
+                reply_reco, post_link
+            ])
+
+        # Write rows
+        if rows:
+            ws.append_rows(rows, value_input_option="USER_ENTERED", table_range="A1")
+            print(f"Wrote {len(rows)} rows to testing sheet '{testing_ws_name}'.")
+            return len(rows)
+        else:
+            print(f"No new rows to write to testing sheet (all duplicates).")
+            return 0
+
+    except Exception as exc:
+        print(f"Failed to write to testing sheet: {exc}")
+        return 0
 
 
 def run_scrape_and_filter() -> List[Dict[str, Any]]:
@@ -448,6 +618,7 @@ def run_scrape_and_filter() -> List[Dict[str, Any]]:
 
     matched: List[Dict[str, Any]] = []
     matched_with_profile: List[Dict[str, Any]] = []
+    all_posts_with_decisions: List[Dict[str, Any]] = []  # NEW: Track ALL posts with LLM decisions
     total_posts = 0
     recent_posts = 0
     reply_posts = 0
@@ -468,9 +639,31 @@ def run_scrape_and_filter() -> List[Dict[str, Any]]:
             text = post.get("text") or post.get("postText") or ""
             if not text:
                 continue
-            if is_match_via_llm(base_prompt, text):
-                matched.append(post)
+
+            # Get LLM decision with reason
+            llm_result = get_llm_decision_with_reason(base_prompt, text)
+            is_match = llm_result["decision"]
+
+            # Generate reply recommendation only for matched posts
+            recommendation = ""
+            if is_match:
                 recommendation = generate_reply_recommendation(text, prompt=reply_prompt)
+
+            # Add to all_posts_with_decisions (for testing sheet)
+            all_posts_with_decisions.append({
+                "profile_url": url,
+                "post": post,
+                "llm_decision": llm_result["decision_text"],
+                "llm_reason": llm_result["reason"],
+                "prompt_used": "match_prompt",
+                "reply_reco": recommendation,
+                "post_id": post.get("id") or post.get("postId") or "",
+                "timestamp": post.get("timestamp"),
+            })
+
+            # Add to matched lists only if LLM says yes (for output sheet)
+            if is_match:
+                matched.append(post)
                 matched_with_profile.append(
                     {
                         "profile_url": url,
@@ -490,6 +683,12 @@ def run_scrape_and_filter() -> List[Dict[str, Any]]:
         pid = post.get("id") or post.get("postId")
         preview = (post.get("text") or post.get("postText") or "")[:140].replace("\n", " ")
         print(f"{idx}. {pid}: {preview!r}")
+
+    # Write ALL posts (including rejected ones) to testing sheet for analysis
+    if all_posts_with_decisions:
+        print(f"\nWriting {len(all_posts_with_decisions)} posts to testing sheet (all-point)...")
+        testing_count = write_all_posts_to_testing_sheet(all_posts_with_decisions)
+        print(f"Testing sheet write complete: {testing_count} rows")
 
     # Persist matches to output sheet if configured.
     output_sheet_id = os.getenv("GOOGLE_X_SCRAPE_OUTPUT")
@@ -512,7 +711,8 @@ def run_scrape_and_filter() -> List[Dict[str, Any]]:
 
             if not any(cell for r in existing for cell in r):
                 ws.append_row(
-                    ["profile_url", "post_content", "timestamp_ms", "reply_recommendation", "post_link"],
+                    ["profile_url", "post_content", "timestamp", "likes", "reposts", "replies", "bookmarks", "views",
+                     "author", "reply_recommendation", "post_link"],
                     value_input_option="USER_ENTERED",
                 )
                 existing = ws.get_all_values()
@@ -537,10 +737,20 @@ def run_scrape_and_filter() -> List[Dict[str, Any]]:
                     or post.get("url")
                     or (f"https://x.com/i/web/status/{post_id}" if post_id else "")
                 )
+
+                # Extract engagement metrics and author
+                likes = post.get("likes", 0)
+                reposts = post.get("retweetCount", 0)
+                replies = post.get("replyCount", 0)
+                bookmarks = post.get("bookmarkCount", 0)
+                views = post.get("viewCount", 0)
+                author = post.get("author", {}).get("userName", "")
+
                 key = (profile_url, text, ts_str)
                 if key in existing_pairs:
                     continue
-                rows.append([profile_url, text, ts_human, reply_reco, post_link])
+                rows.append([profile_url, text, ts_human, likes, reposts, replies, bookmarks, views,
+                            author, reply_reco, post_link])
             if rows:
                 ws.append_rows(rows, value_input_option="USER_ENTERED", table_range="A1")
             print(f"Wrote {len(rows)} rows to output sheet '{output_ws_name}'.")
