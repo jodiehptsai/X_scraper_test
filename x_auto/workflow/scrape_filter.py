@@ -115,8 +115,11 @@ def get_profile_urls(sheet_client: GoogleSheetsClient, sheet_name: str = "profil
                     h = h.strip().lstrip("@")
                     # Remove anything in parentheses (e.g., "(founder)")
                     h = re.sub(r'\s*\([^)]*\)\s*', '', h).strip()
-                    if h and h.lower() not in {"n/a", "na"}:
-                        urls.append(f"https://x.com/{h}")
+                    # Filter out invalid handles
+                    if h and h.lower() not in {"n/a", "na", "https:", "http:", "x.com", "twitter.com"}:
+                        # Validate handle format (alphanumeric, underscore, no spaces/special chars)
+                        if re.match(r'^[a-zA-Z0-9_]+$', h):
+                            urls.append(f"https://x.com/{h}")
     except Exception:
         records = None
 
