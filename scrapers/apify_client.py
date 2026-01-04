@@ -1,40 +1,71 @@
 """
-Connector for the Apify actor `scraper_one/x-profile-posts-scraper`.
+Connector for the Apify actor `apidojo/twitter-scraper-lite` (Twitter Scraper Unlimited).
 
 This module is responsible solely for invoking the actor and returning raw data.
 It does not implement any downstream business logic.
 
+Features:
+- Batch query multiple X accounts (no explicit limit)
+- Date range filtering using Twitter query syntax (since/until)
+- Supports sorting by "Latest" or "Top"
+
+Implementation:
+- Uses `searchTerms` parameter with Twitter query syntax: "from:handle since:date until:date"
+- Date filtering happens at API level, reducing unnecessary data transfer
+
 Example:
     >>> from scrapers.apify_client import fetch_posts
-    >>> posts = fetch_posts(["https://x.com/example_user"], results_limit=10)
+    >>> posts = fetch_posts(["elonmusk", "NASA"], max_items=100)
     >>> print(len(posts))
+
+    # With date filtering (API-level filtering using Twitter query syntax):
+    >>> posts = fetch_posts(
+    ...     handles=["elonmusk"],
+    ...     max_items=50,
+    ...     start_date="2025-01-01",
+    ...     end_date="2025-12-31"
+    ... )
+    # This will use searchTerms: ["from:elonmusk since:2025-01-01 until:2025-12-31"]
 """
 
 from __future__ import annotations
 
 import os
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import requests
 
 APIFY_RUN_URL = (
     "https://api.apify.com/v2/acts/"
-    "scraper_one~x-profile-posts-scraper/run-sync-get-dataset-items"
+    "apidojo~twitter-scraper-lite/run-sync-get-dataset-items"
 )
 
 
 def fetch_posts(
-    profile_urls: List[str], results_limit: int = 20, timeout_seconds: int = 600
+    handles: List[str],
+    max_items: int = 100,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    sort: str = "Latest",
+    timeout_seconds: int = 600,
 ) -> List[Dict]:
     """
-    Call the Apify actor to retrieve recent posts for the given X profile URLs.
+    Call the Apify actor to retrieve posts for the given X handles.
+
+    Uses Twitter query syntax with searchTerms for efficient date filtering at API level.
+    If dates are provided, constructs queries like: "from:handle since:YYYY-MM-DD until:YYYY-MM-DD"
 
     Args:
-        profile_urls: List of full X profile URLs (e.g., https://x.com/handle).
-        results_limit: Maximum number of posts to retrieve per profile.
+        handles: List of X handles (without @, e.g., ["elonmusk", "NASA"]).
+        max_items: Maximum number of posts to retrieve in total.
+        start_date: Optional start date in YYYY-MM-DD format. Returns tweets on/after this date.
+        end_date: Optional end date in YYYY-MM-DD format. Returns tweets on/before this date.
+        sort: Sort order - "Latest" or "Top". Default is "Latest" for more results.
+        timeout_seconds: Request timeout in seconds.
 
     Returns:
         A list of post dictionaries as returned by the Apify actor.
+        When date filtering is applied, only posts within the date range are returned.
 
     Raises:
         ValueError: If the APIFY_TOKEN environment variable is missing.
@@ -44,7 +75,26 @@ def fetch_posts(
     if not token:
         raise ValueError("APIFY_TOKEN environment variable is required but missing.")
 
-    payload = {"profileUrls": profile_urls, "resultsLimit": results_limit}
+    # Build search terms with Twitter query syntax for date filtering
+    # Twitter syntax: "from:handle since:YYYY-MM-DD until:YYYY-MM-DD"
+    search_terms = []
+    for handle in handles:
+        if start_date and end_date:
+            # Use Twitter query syntax with date range
+            query = f"from:{handle} since:{start_date} until:{end_date}"
+        else:
+            # Simple query without date filtering
+            query = f"from:{handle}"
+        search_terms.append(query)
+
+    # Build payload with searchTerms (instead of twitterHandles)
+    payload: Dict = {
+        "searchTerms": search_terms,
+        "maxItems": max_items,
+        "sort": sort,
+    }
+    # Note: Date filtering is now embedded in searchTerms, no separate start/end parameters
+
     params = {"token": token}
 
     response = requests.post(
@@ -58,3 +108,43 @@ def fetch_posts(
         raise requests.HTTPError(message, response=response)
 
     return response.json()
+
+
+# Backward compatibility alias
+def fetch_posts_by_urls(
+    profile_urls: List[str],
+    results_limit: int = 20,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    timeout_seconds: int = 600,
+) -> List[Dict]:
+    """
+    Backward compatible function that accepts profile URLs instead of handles.
+    
+    Args:
+        profile_urls: List of full X profile URLs (e.g., https://x.com/handle).
+        results_limit: Maximum number of posts to retrieve.
+        start_date: Optional start date in YYYY-MM-DD format.
+        end_date: Optional end date in YYYY-MM-DD format.
+        timeout_seconds: Request timeout in seconds.
+
+    Returns:
+        A list of post dictionaries as returned by the Apify actor.
+    """
+    # Extract handles from URLs
+    handles = []
+    for url in profile_urls:
+        # Handle both x.com and twitter.com URLs
+        url = url.rstrip("/")
+        handle = url.split("/")[-1]
+        # Remove @ if present
+        handle = handle.lstrip("@")
+        handles.append(handle)
+
+    return fetch_posts(
+        handles=handles,
+        max_items=results_limit,
+        start_date=start_date,
+        end_date=end_date,
+        timeout_seconds=timeout_seconds,
+    )

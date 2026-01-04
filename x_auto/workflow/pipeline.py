@@ -38,8 +38,10 @@ def run_pipeline() -> None:
         This function focuses on orchestration; several utilities are intentionally
         left as stubs for future implementation.
     """
+    # Use unified GOOGLE_SHEET_ID with fallback to legacy env vars
+    sheet_id = os.getenv("GOOGLE_SHEET_ID") or os.getenv("GOOGLE_X_ACCOUNT_ID")
     spreadsheet_name = os.getenv("GOOGLE_SPREADSHEET_NAME", "Automation Config")
-    sheet_client = GoogleSheetsClient(spreadsheet_name=spreadsheet_name)
+    sheet_client = GoogleSheetsClient(spreadsheet_name=spreadsheet_name, spreadsheet_id=sheet_id)
     enable_posting = os.getenv("ENABLE_X_POSTING", "false").lower() == "true"
 
     profile_rows = sheet_client.read_records("profiles")
@@ -88,7 +90,7 @@ def filter_already_processed(
     Args:
         posts: Raw posts returned by Apify.
         sheet_client: Optional GoogleSheetsClient instance. If None, creates a new one.
-        output_sheet_name: Optional worksheet name. If None, uses GOOGLE_X_SCRAPE_OUTPUT_WORKSHEET.
+        output_sheet_name: Optional worksheet name. If None, uses GOOGLE_WS_SCRAPED_OUTPUT.
 
     Returns:
         A filtered list containing only new/unprocessed posts.
@@ -96,9 +98,9 @@ def filter_already_processed(
     if not posts:
         return []
 
-    # Get or create sheet client
+    # Get or create sheet client (新版整合 + 向後相容)
     if sheet_client is None:
-        output_sheet_id = os.getenv("GOOGLE_X_SCRAPE_OUTPUT")
+        output_sheet_id = os.getenv("GOOGLE_SHEET_ID") or os.getenv("GOOGLE_X_SCRAPE_OUTPUT")
         if not output_sheet_id:
             # If no output sheet configured, return all posts (no filtering)
             return posts
@@ -107,9 +109,9 @@ def filter_already_processed(
             spreadsheet_id=output_sheet_id
         )
 
-    # Get worksheet name
+    # Get worksheet name (新版整合 + 向後相容)
     if output_sheet_name is None:
-        output_sheet_name = os.getenv("GOOGLE_X_SCRAPE_OUTPUT_WORKSHEET", "scraped_output")
+        output_sheet_name = os.getenv("GOOGLE_WS_SCRAPED_OUTPUT") or os.getenv("GOOGLE_X_SCRAPE_OUTPUT_WORKSHEET", "scraped_output")
 
     # Fetch existing post IDs from the output sheet
     try:

@@ -3,7 +3,7 @@
 End-to-end scraping workflow: Read profiles → Scrape posts → Filter duplicates → Store in Google Sheets
 
 This script orchestrates the complete data collection pipeline:
-1. Reads X profile URLs from the configured Google Sheet (Researcher worksheet)
+1. Reads X profile URLs from the configured Google Sheet (profiles worksheet)
 2. Scrapes recent posts from each profile using the Apify scraper
 3. Filters out posts that have already been processed (deduplication)
 4. Writes new posts to the output Google Sheet
@@ -11,15 +11,17 @@ This script orchestrates the complete data collection pipeline:
 Usage:
     python scrape_and_store.py
 
-Environment variables required:
-    - GOOGLE_SERVICE_ACCOUNT_PATH: Path to Google service account JSON
-    - GOOGLE_X_ACCOUNT_ID: Google Sheet ID containing profile URLs
-    - GOOGLE_X_PROFILES_WORKSHEET: Worksheet name with profiles (default: "Researcher")
-    - GOOGLE_X_SCRAPE_OUTPUT: Google Sheet ID for output
-    - GOOGLE_X_SCRAPE_OUTPUT_WORKSHEET: Worksheet name for output (default: "scraped_output")
+Environment variables (新版整合):
+    - GOOGLE_SHEET_ID: 單一 Google Sheet ID (所有 worksheets 都在這裡)
+    - GOOGLE_WS_PROFILES: profiles worksheet 名稱 (default: "profiles")
+    - GOOGLE_WS_SCRAPED_OUTPUT: scraped_output worksheet 名稱 (default: "scraped_output")
     - APIFY_TOKEN: Apify API token
     - MAX_PROFILE_URLS: Maximum number of profiles to process (default: 3)
     - POST_RESULTS_LIMIT: Maximum posts per profile (default: 3)
+
+Legacy env vars (向後相容):
+    - GOOGLE_X_ACCOUNT_ID, GOOGLE_X_PROFILES_WORKSHEET
+    - GOOGLE_X_SCRAPE_OUTPUT, GOOGLE_X_SCRAPE_OUTPUT_WORKSHEET
 """
 
 from __future__ import annotations
@@ -80,26 +82,21 @@ def main():
     print("X-PIGGYBACKING: SCRAPE AND STORE WORKFLOW")
     print("=" * 70)
 
-    # Get configuration from environment
-    profiles_sheet_id = os.getenv("GOOGLE_X_ACCOUNT_ID")
-    profiles_worksheet = os.getenv("GOOGLE_X_PROFILES_WORKSHEET", "Researcher")
-    output_sheet_id = os.getenv("GOOGLE_X_SCRAPE_OUTPUT")
-    output_worksheet = os.getenv("GOOGLE_X_SCRAPE_OUTPUT_WORKSHEET", "scraped_output")
+    # Get configuration from environment (新版整合 + 向後相容)
+    # 使用單一 GOOGLE_SHEET_ID，fallback 到舊的環境變數
+    sheet_id = os.getenv("GOOGLE_SHEET_ID") or os.getenv("GOOGLE_X_ACCOUNT_ID")
+    profiles_worksheet = os.getenv("GOOGLE_WS_PROFILES") or os.getenv("GOOGLE_X_PROFILES_WORKSHEET", "profiles")
+    output_worksheet = os.getenv("GOOGLE_WS_SCRAPED_OUTPUT") or os.getenv("GOOGLE_X_SCRAPE_OUTPUT_WORKSHEET", "scraped_output")
     max_profiles = int(os.getenv("MAX_PROFILE_URLS", "3"))
     posts_per_profile = int(os.getenv("POST_RESULTS_LIMIT", "3"))
 
-    if not profiles_sheet_id:
-        print("ERROR: GOOGLE_X_ACCOUNT_ID is not set in .env")
-        sys.exit(1)
-
-    if not output_sheet_id:
-        print("ERROR: GOOGLE_X_SCRAPE_OUTPUT is not set in .env")
+    if not sheet_id:
+        print("ERROR: GOOGLE_SHEET_ID (或 GOOGLE_X_ACCOUNT_ID) is not set in .env")
         sys.exit(1)
 
     print(f"\nConfiguration:")
-    print(f"  Profiles sheet: {profiles_sheet_id}")
+    print(f"  Sheet ID: {sheet_id}")
     print(f"  Profiles worksheet: {profiles_worksheet}")
-    print(f"  Output sheet: {output_sheet_id}")
     print(f"  Output worksheet: {output_worksheet}")
     print(f"  Max profiles to process: {max_profiles}")
     print(f"  Posts per profile: {posts_per_profile}")
@@ -108,11 +105,11 @@ def main():
     # Step 1: Connect to Google Sheets and get profile URLs
     print("[1/4] Reading profile URLs from Google Sheets...")
     try:
-        profiles_client = GoogleSheetsClient(
-            spreadsheet_name="Profiles Sheet",
-            spreadsheet_id=profiles_sheet_id
+        sheet_client = GoogleSheetsClient(
+            spreadsheet_name="X-Piggybacking Sheet",
+            spreadsheet_id=sheet_id
         )
-        all_profile_urls = get_profile_urls(profiles_client, profiles_worksheet)
+        all_profile_urls = get_profile_urls(sheet_client, profiles_worksheet)
 
         if not all_profile_urls:
             print("No profile URLs found in the worksheet.")
@@ -139,13 +136,10 @@ def main():
     # Step 3: Filter out already processed posts
     print(f"\n[3/4] Filtering duplicate posts...")
     try:
-        output_client = GoogleSheetsClient(
-            spreadsheet_name="Scrape Output",
-            spreadsheet_id=output_sheet_id
-        )
+        # 使用同一個 sheet_client，因為現在所有 worksheets 都在同一個 Sheet 內
         new_posts = filter_already_processed(
             all_posts,
-            sheet_client=output_client,
+            sheet_client=sheet_client,
             output_sheet_name=output_worksheet
         )
         print(f"Found {len(new_posts)} new posts (filtered {len(all_posts) - len(new_posts)} duplicates)")
@@ -158,7 +152,7 @@ def main():
         print(f"\n[4/4] Writing {len(new_posts)} new posts to Google Sheets...")
         try:
             count = write_scraped_posts(
-                output_client,
+                sheet_client,
                 output_worksheet,
                 new_posts,
                 ensure_headers=True

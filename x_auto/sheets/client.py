@@ -53,21 +53,40 @@ class GoogleSheetsClient:
     """
 
     def __init__(self, spreadsheet_name: str, spreadsheet_id: str | None = None):
-        service_account_path = os.getenv("GOOGLE_SERVICE_ACCOUNT_PATH")
-        if not service_account_path:
-            raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_PATH is required but missing.")
+        # Option 1: Base64 environment variable (Railway/cloud deployment)
+        creds_base64 = os.getenv("GOOGLE_SHEETS_CREDENTIALS_BASE64")
 
-        credentials_path = Path(service_account_path)
-        if not credentials_path.is_file():
-            raise RuntimeError(f"Service account file not found at {credentials_path}")
+        if creds_base64:
+            import base64
+            import json
+            creds_json = base64.b64decode(creds_base64).decode('utf-8')
+            creds_dict = json.loads(creds_json)
+            credentials = Credentials.from_service_account_info(
+                creds_dict,
+                scopes=DEFAULT_SCOPES
+            )
+        else:
+            # Option 2: File path (local development)
+            service_account_path = os.getenv("GOOGLE_SERVICE_ACCOUNT_PATH")
+            if not service_account_path:
+                raise RuntimeError(
+                    "Either GOOGLE_SHEETS_CREDENTIALS_BASE64 or "
+                    "GOOGLE_SERVICE_ACCOUNT_PATH is required but both are missing."
+                )
 
-        credentials = Credentials.from_service_account_file(
-            str(credentials_path),
-            scopes=DEFAULT_SCOPES,
-        )
+            credentials_path = Path(service_account_path)
+            if not credentials_path.is_file():
+                raise RuntimeError(f"Service account file not found at {credentials_path}")
+
+            credentials = Credentials.from_service_account_file(
+                str(credentials_path),
+                scopes=DEFAULT_SCOPES,
+            )
+
         client = gspread.authorize(credentials)
 
-        env_spreadsheet_id = os.getenv("GOOGLE_X_ACCOUNT_ID")
+        # Support unified GOOGLE_SHEET_ID (new) with fallback to GOOGLE_X_ACCOUNT_ID (legacy)
+        env_spreadsheet_id = os.getenv("GOOGLE_SHEET_ID") or os.getenv("GOOGLE_X_ACCOUNT_ID")
         spreadsheet_id = spreadsheet_id or env_spreadsheet_id
         try:
             if spreadsheet_id:

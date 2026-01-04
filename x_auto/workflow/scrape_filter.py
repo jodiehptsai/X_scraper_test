@@ -52,7 +52,8 @@ def get_profile_urls(sheet_client: GoogleSheetsClient, sheet_name: str = "profil
     Returns:
         List of validated X profile URLs.
     """
-    worksheet_name = os.getenv("GOOGLE_X_PROFILES_WORKSHEET", sheet_name)
+    # New env var with fallback to legacy
+    worksheet_name = os.getenv("GOOGLE_WS_PROFILES") or os.getenv("GOOGLE_X_PROFILES_WORKSHEET", sheet_name)
     try:
         worksheet = sheet_client.get_sheet(worksheet_name)
     except RuntimeError:
@@ -152,19 +153,35 @@ def is_recent_post(post: Dict[str, Any], days: int = 30) -> bool:
     Check whether a post's timestamp falls within the last N days.
 
     Args:
-        post: Post dictionary (expects a 'timestamp' field in milliseconds).
+        post: Post dictionary (expects a 'timestamp' field in milliseconds or 'createdAt' string).
         days: Window size in days to treat as recent.
 
     Returns:
         True if timestamp is within the window; False otherwise.
     """
+    # Try timestamp field first (milliseconds)
     ts = post.get("timestamp")
-    if ts is None:
+    if ts is not None:
+        try:
+            ts_dt = datetime.fromtimestamp(int(ts) / 1000, tz=timezone.utc)
+        except Exception:
+            ts_dt = None
+    else:
+        # Fallback to createdAt string (e.g., "Sat Jan 03 12:55:35 +0000 2026")
+        created_at = post.get("createdAt")
+        if not created_at:
+            return False
+        try:
+            # Parse format: "Sat Jan 03 12:55:35 +0000 2026"
+            ts_dt = datetime.strptime(created_at, "%a %b %d %H:%M:%S %z %Y")
+            # Convert to UTC
+            ts_dt = ts_dt.astimezone(timezone.utc)
+        except Exception:
+            return False
+
+    if ts_dt is None:
         return False
-    try:
-        ts_dt = datetime.fromtimestamp(int(ts) / 1000, tz=timezone.utc)
-    except Exception:
-        return False
+
     cutoff = datetime.now(tz=timezone.utc) - timedelta(days=days)
     return ts_dt >= cutoff
 
@@ -434,10 +451,11 @@ def get_prompts_from_sheet() -> Dict[str, str]:
     Expects columns: name, prompt (first row as header). Returns a mapping.
     Falls back to defaults if env not set or sheet unreadable.
     """
-    prompts_sheet_id = os.getenv("GOOGLE_X_PROMPTS_SHEET_ID")
+    # New env var with fallback to legacy
+    prompts_sheet_id = os.getenv("GOOGLE_SHEET_ID") or os.getenv("GOOGLE_X_PROMPTS_SHEET_ID")
     if not prompts_sheet_id:
         return {}
-    worksheet_name = os.getenv("GOOGLE_X_PROMPTS_WORKSHEET", "prompts")
+    worksheet_name = os.getenv("GOOGLE_WS_PROMPTS") or os.getenv("GOOGLE_X_PROMPTS_WORKSHEET", "prompts")
     try:
         client = GoogleSheetsClient(spreadsheet_name="prompts_sheet", spreadsheet_id=prompts_sheet_id)
         ws = client.get_sheet(worksheet_name)
@@ -467,7 +485,7 @@ def format_timestamp(ts: Any) -> str:
 
 def write_all_posts_to_testing_sheet(all_posts_data: List[Dict[str, Any]]) -> int:
     """
-    Write ALL scraped posts (including filtered out ones) to testing sheet for analysis.
+    Write ALL scraped posts (including filtered out ones) to all_post worksheet for analysis.
 
     Args:
         all_posts_data: List of post dictionaries with LLM decisions
@@ -478,11 +496,12 @@ def write_all_posts_to_testing_sheet(all_posts_data: List[Dict[str, Any]]) -> in
     if not all_posts_data:
         return 0
 
-    testing_sheet_id = os.getenv("GOOGLE_X_TESTING_SHEET_ID")
-    testing_ws_name = os.getenv("GOOGLE_X_TESTING_WORKSHEET", "all-point")
+    # New env var with fallback to legacy
+    testing_sheet_id = os.getenv("GOOGLE_SHEET_ID") or os.getenv("GOOGLE_X_TESTING_SHEET_ID")
+    testing_ws_name = os.getenv("GOOGLE_WS_ALL_POST") or os.getenv("GOOGLE_X_TESTING_WORKSHEET", "all_post")
 
     if not testing_sheet_id:
-        print("GOOGLE_X_TESTING_SHEET_ID not configured, skipping testing sheet write")
+        print("GOOGLE_SHEET_ID not configured, skipping all_post sheet write")
         return 0
 
     try:
@@ -590,7 +609,13 @@ def run_scrape_and_filter() -> List[Dict[str, Any]]:
         List of matched post dictionaries.
     """
     load_env()
-    sheet_client = GoogleSheetsClient(spreadsheet_name=os.getenv("GOOGLE_SPREADSHEET_NAME", "Automation Config"))
+    
+    # Use unified GOOGLE_SHEET_ID with fallback to legacy env vars
+    sheet_id = os.getenv("GOOGLE_SHEET_ID") or os.getenv("GOOGLE_X_ACCOUNT_ID")
+    sheet_client = GoogleSheetsClient(
+        spreadsheet_name=os.getenv("GOOGLE_SPREADSHEET_NAME", "Automation Config"),
+        spreadsheet_id=sheet_id,
+    )
     profile_urls = get_profile_urls(sheet_client)
     max_profiles = int(os.getenv("MAX_PROFILE_URLS", "0") or 0)
     batch_start = int(os.getenv("PROFILE_BATCH_START", "0") or 0)
@@ -634,13 +659,61 @@ def run_scrape_and_filter() -> List[Dict[str, Any]]:
     recent_posts = 0
     reply_posts = 0
     post_limit = int(os.getenv("POST_RESULTS_LIMIT", "5") or 5)
-    for idx, url in enumerate(profile_urls, start=1):
-        print(f"[{idx}/{len(profile_urls)}] Fetching posts for {url}")
-        posts = fetch_posts([url], results_limit=post_limit)
+    lookback_days = int(os.getenv("LOOKBACK_DAYS", "30") or 30)
+
+    # Calculate date range for filtering
+    from datetime import datetime, timedelta, timezone
+    end_date = datetime.now(tz=timezone.utc)
+    start_date = end_date - timedelta(days=lookback_days)
+    start_date_str = start_date.strftime("%Y-%m-%d")
+    end_date_str = end_date.strftime("%Y-%m-%d")
+
+    # Extract handles from profile URLs for batch fetching
+    handles = []
+    url_to_handle = {}
+    for url in profile_urls:
+        # Extract handle from URL like https://x.com/username
+        handle = url.rstrip('/').split('/')[-1]
+        handles.append(handle)
+        url_to_handle[handle] = url
+
+    # Batch fetch all posts at once with date filter (much faster and more efficient!)
+    print(f"\nBatch fetching posts for {len(handles)} profiles...")
+    print(f"Date range: {start_date_str} to {end_date_str} ({lookback_days} day(s))")
+    print(f"Handles: {', '.join(handles[:5])}{'...' if len(handles) > 5 else ''}")
+
+    all_posts = fetch_posts(
+        handles,
+        max_items=post_limit * len(handles),
+        start_date=start_date_str,
+        end_date=end_date_str
+    )
+    print(f"Fetched {len(all_posts)} posts within date range from batch query")
+
+    # Group posts by author for processing
+    posts_by_handle: Dict[str, List[Dict[str, Any]]] = {}
+    for post in all_posts:
+        author_handle = post.get("author", {}).get("userName", "")
+        if author_handle:
+            posts_by_handle.setdefault(author_handle, []).append(post)
+
+    # Process each profile's posts
+    # Note: Apify API date filters may not work as expected, so we filter again here
+    for idx, handle in enumerate(handles, start=1):
+        url = url_to_handle[handle]
+        posts = posts_by_handle.get(handle, [])
+
+        print(f"[{idx}/{len(handles)}] Fetched {len(posts)} posts for {url}")
         total_posts += len(posts)
-        lookback_days = int(os.getenv("LOOKBACK_DAYS", "30") or 30)
+
+        # Filter by date (in case API didn't filter correctly)
         recent = [p for p in posts if is_recent_post(p, days=lookback_days)]
+        print(f"   → {len(recent)} posts within last {lookback_days} day(s)")
         recent_posts += len(recent)
+
+        if not recent:
+            continue  # Skip if no recent posts
+
         replies = [p for p in recent if is_reply(p)]
         reply_posts += len(replies)
         # Merge by conversation id and 2-minute window; include originals if no replies found.
@@ -687,7 +760,7 @@ def run_scrape_and_filter() -> List[Dict[str, Any]]:
 
     # For now, print a simple summary and return the matches for caller use.
     print(f"Total posts fetched: {total_posts}")
-    print(f"Posts within last 30 days: {recent_posts}")
+    print(f"Posts within last {lookback_days} day(s): {recent_posts}")
     print(f"Replies considered (<=2 min merge per author): {reply_posts}")
     print(f"Matched (LLM yes) posts: {len(matched)}")
     for idx, post in enumerate(matched, 1):
@@ -697,13 +770,14 @@ def run_scrape_and_filter() -> List[Dict[str, Any]]:
 
     # Write ALL posts (including rejected ones) to testing sheet for analysis
     if all_posts_with_decisions:
-        print(f"\nWriting {len(all_posts_with_decisions)} posts to testing sheet (all-point)...")
+        print(f"\nWriting {len(all_posts_with_decisions)} posts to testing sheet (all_post)...")
         testing_count = write_all_posts_to_testing_sheet(all_posts_with_decisions)
         print(f"Testing sheet write complete: {testing_count} rows")
 
-    # Persist matches to output sheet if configured.
-    output_sheet_id = os.getenv("GOOGLE_X_SCRAPE_OUTPUT")
-    output_ws_name = os.getenv("GOOGLE_X_SCRAPE_OUTPUT_WORKSHEET", "scrape_output")
+    # Persist matches to scraped_output worksheet (llm_decision=yes posts)
+    # New env var with fallback to legacy
+    output_sheet_id = os.getenv("GOOGLE_SHEET_ID") or os.getenv("GOOGLE_X_SCRAPE_OUTPUT")
+    output_ws_name = os.getenv("GOOGLE_WS_SCRAPED_OUTPUT") or os.getenv("GOOGLE_X_SCRAPE_OUTPUT_WORKSHEET", "scraped_output")
     if output_sheet_id and matched_with_profile:
         try:
             out_client = GoogleSheetsClient(

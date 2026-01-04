@@ -1,14 +1,19 @@
-# Environment variables (contains API keys and secrets)
+# Environment files (contains secrets)
 .env
 .env.local
-RAILWAY_ENV.md
+.env.*.local
 
-# Google Service Account credentials
+# Service account credentials (use GOOGLE_SHEETS_CREDENTIALS_BASE64 instead)
 *.json
 !package.json
 !package-lock.json
 
-# Python
+# Git repository
+.git
+.gitignore
+.gitattributes
+
+# Python cache and build artifacts
 __pycache__/
 *.py[cod]
 *$py.class
@@ -36,7 +41,7 @@ ENV/
 env/
 .venv
 
-# IDEs
+# IDE files
 .vscode/
 .idea/
 *.swp
@@ -48,10 +53,24 @@ env/
 .pytest_cache/
 .coverage
 htmlcov/
+tests/
+test_*.py
+*_test.py
+
+# Documentation
+docs/
+*.md
+!README.md
 
 # Logs
 *.log
 
-# Personal notes and todos
+# Personal notes
 todo.md
 notes.md
+
+# POC and experimental files
+poc_*.py
+experiment_*.py
+temp_*.py
+/tmp/
