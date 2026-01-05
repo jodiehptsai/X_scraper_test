@@ -35,7 +35,7 @@ from dotenv import load_dotenv
 # Load environment variables
 load_dotenv(override=True)
 
-from scrapers.apify_client import fetch_posts
+from scrapers.apify_client import fetch_posts_by_urls
 from x_auto.sheets.client import GoogleSheetsClient, write_scraped_posts
 from x_auto.workflow.pipeline import filter_already_processed
 
@@ -62,6 +62,7 @@ def get_profile_urls(sheet_client: GoogleSheetsClient, worksheet_name: str) -> L
                 record.get("x_profile_url") or
                 record.get("Profile URL") or
                 record.get("X Profile URL") or
+                record.get("X (link)") or
                 record.get("url") or
                 record.get("URL") or
                 ""
@@ -115,8 +116,11 @@ def main():
             print("No profile URLs found in the worksheet.")
             sys.exit(0)
 
-        # Limit to max_profiles
-        profile_urls = all_profile_urls[:max_profiles]
+        # Limit to max_profiles (0 means process all)
+        if max_profiles > 0:
+            profile_urls = all_profile_urls[:max_profiles]
+        else:
+            profile_urls = all_profile_urls
         print(f"Found {len(all_profile_urls)} total profiles, processing {len(profile_urls)}")
         for i, url in enumerate(profile_urls, 1):
             print(f"  {i}. {url}")
@@ -127,7 +131,7 @@ def main():
     # Step 2: Scrape posts from Apify
     print(f"\n[2/4] Scraping posts from {len(profile_urls)} profiles...")
     try:
-        all_posts = fetch_posts(profile_urls, results_limit=posts_per_profile)
+        all_posts = fetch_posts_by_urls(profile_urls, results_limit=posts_per_profile)
         print(f"Scraped {len(all_posts)} total posts")
     except Exception as e:
         print(f"ERROR: Failed to scrape posts: {e}")
