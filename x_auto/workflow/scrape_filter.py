@@ -436,13 +436,13 @@ def get_llm_decision_with_reason(prompt: str, post_text: str) -> Dict[str, Any]:
 
         return {
             "decision": "yes" in decision_text,
-            "decision_text": "yes" if "yes" in decision_text else "no",
+            "decision_text": 1 if "yes" in decision_text else 0,
             "reason": reason
         }
     except Exception as e:
         return {
             "decision": False,
-            "decision_text": "error",
+            "decision_text": 0,
             "reason": f"Error getting LLM decision: {str(e)}"
         }
 

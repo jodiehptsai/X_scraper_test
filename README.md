@@ -1,31 +1,37 @@
 # X Automation Starter
 
-This project scaffolds an automation system that reads X (Twitter) handles and reply templates from Google Sheets, scrapes recent posts with Apify, evaluates them against keyword rules, generates candidate replies, optionally routes them through human review, posts replies via the X API, and logs all activity.
+This project automates X (Twitter) monitoring: scrapes posts from target profiles, evaluates them with AI, categorizes content, generates reply recommendations, and sends daily summaries via Telegram.
 
 ## Features
-- Pull profile lists and templates from Google Sheets.
-- Scrape recent posts via the Apify `scraper_one/x-profile-posts-scraper` actor.
-- Score posts with keyword matching to decide whether to reply.
-- Generate reply text from templates or dynamic builders.
-- Optional human review via chat or Sheets before posting.
-- Post replies through the X API.
-- Log every step back to Google Sheets.
-- **Send daily summaries to Telegram** - Get notifications of new posts with categories and summaries.
-- Run on schedules (cron, GitHub Actions, or Apify Actor runner).
+- **Profile monitoring** - Track X handles from Google Sheets
+- **Apify scraping** - Fetch recent posts via `scraper_one/x-profile-posts-scraper`
+- **AI-powered filtering** - LLM evaluates each post for relevance (decision recorded as 0/1)
+- **Post categorization** - Auto-categorize posts (token_analysis, industry_analysis, market_comment, etc.)
+- **Smart summaries** - Generate concise headlines for quick review
+- **Reply generation** - AI-powered reply recommendations
+- **Telegram notifications** - Daily summaries organized by category with emoji indicators
+- **Google Sheets logging** - Track all posts and decisions
+- **Scheduled execution** - Run on Railway, cron, or GitHub Actions
 
 ## Setup
-1) Create a Python 3.10+ virtual environment.
-2) Install dependencies: `pip install -r requirements.txt`.
-3) Copy `.env.example` to `.env` and fill in credentials.
-4) Ensure the Google service account has access to the target Sheets.
-5) Configure Apify token and X API credentials in the environment.
-6) **Configure Telegram Bot (optional)**:
-   - Create a bot via [@BotFather](https://t.me/botfather) on Telegram
-   - Get your bot token from BotFather
-   - Get your chat ID by messaging [@userinfobot](https://t.me/userinfobot)
-   - Add to `.env`: `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID`
-   - Enable notifications: `ENABLE_TELEGRAM_NOTIFICATIONS=true`
-7) Run the orchestrator: `python main.py`.
+1) Create a Python 3.11+ virtual environment
+2) Install dependencies: `pip install -r requirements.txt`
+3) Copy `.env.example` to `.env` and fill in credentials
+4) Share your Google Sheet with the service account email (from JSON credentials)
+5) Configure required env vars: `APIFY_TOKEN`, `OPENAI_API_KEY`, `GOOGLE_SHEET_ID`
+6) **(Optional) Telegram notifications**:
+   - Create bot via [@BotFather](https://t.me/botfather), get token
+   - Get chat ID from [@userinfobot](https://t.me/userinfobot)
+   - Add to `.env`: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `ENABLE_TELEGRAM_NOTIFICATIONS=true`
+7) Run: `python main.py`
+
+## Google Sheets Structure
+
+**Single unified sheet** with these worksheets:
+- `profiles` (or `Researcher`) - Input: X handles to monitor
+- `prompts` (or `prompt_inuse`) - Input: LLM prompts for filtering/replies/categorization
+- `all_post` - Output: All scraped posts with llm_decision (0/1), reasons, engagement metrics
+- `scraped_output` - Output: Matched posts (llm_decision=1) with reply recommendations, summaries, categories
 
 ## Telegram Notifications
 
@@ -51,17 +57,18 @@ ENABLE_TELEGRAM_NOTIFICATIONS=true python scrape_and_store.py
 - Set `ENABLE_TELEGRAM_NOTIFICATIONS=true` in `.env` to enable
 
 ## Structure
-- `x_auto/config`: Environment loading and credential helpers.
-- `x_auto/sheets`: Google Sheets read/write utilities.
-- `x_auto/scrapers`: Apify integration for fetching posts.
-- `x_auto/matcher`: Keyword detection, scoring, and template selection.
-- `x_auto/reply_engine`: Reply message construction.
-- `x_auto/x_api`: X API client for posting replies.
-- `x_auto/workflow`: End-to-end pipeline orchestration.
-- `x_auto/utils`: Shared helpers (logging, rate limiting, ID tracking).
-- `docs/architecture.md`: High-level flow description.
+- `x_auto/config` - Environment loading and credential helpers
+- `x_auto/sheets` - Google Sheets read/write utilities
+- `x_auto/scrapers` - Apify integration for fetching posts
+- `x_auto/matcher` - Keyword detection, scoring, template selection
+- `x_auto/reply_engine` - Reply message construction
+- `x_auto/x_api` - X API client for posting replies
+- `x_auto/notifications` - Telegram bot integration for daily summaries
+- `x_auto/workflow` - End-to-end pipeline orchestration (scraping, filtering, LLM evaluation)
+- `x_auto/utils` - Shared helpers (logging, rate limiting, ID tracking)
+- `docs/architecture.md` - High-level flow description
 
 ## Next Steps
-- Implement each stub with real API calls and business logic.
-- Add tests around scoring, template selection, and posting safety checks.
-- Wire the scheduler (cron, GitHub Actions, or Apify Runner) to call `main.py`.
+- Review and adjust LLM prompts in the `prompts` worksheet for optimal filtering
+- Monitor API costs and performance (Apify, OpenAI usage)
+- Set `ENABLE_X_POSTING=true` when ready to post live replies to X
