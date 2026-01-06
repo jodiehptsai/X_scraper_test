@@ -44,7 +44,7 @@ def load_env() -> None:
 
     if is_cloud:
         # In cloud: use platform-provided environment variables
-        logger.info("Detected cloud environment, using platform environment variables")
+        print("INFO: Detected cloud environment, using platform environment variables")
         return
 
     # In local development: try to load from .env
@@ -54,9 +54,9 @@ def load_env() -> None:
 
     if os.path.isfile(env_path):
         load_dotenv(env_path, override=True)
-        logger.info("Loaded environment variables from .env")
+        print("INFO: Loaded environment variables from .env")
     else:
-        logger.warning("No .env file found in local development")
+        print("WARNING: No .env file found in local development")
 
     # IMPORTANT: Do NOT fallback to .env.example
     # .env.example is a template only and should never be loaded
