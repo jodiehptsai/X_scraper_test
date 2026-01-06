@@ -28,17 +28,38 @@ from x_auto.sheets.client import GoogleSheetsClient
 
 
 def load_env() -> None:
-    """Load environment variables from .env if present."""
-    # Get the project root directory (two levels up from this file)
+    """
+    Load environment variables from .env if present.
+
+    In cloud environments (Railway, Docker, etc.), skip loading .env files
+    since environment variables are managed by the platform.
+    """
+    # Check if running in a cloud environment
+    is_cloud = (
+        os.getenv("RAILWAY_ENVIRONMENT") is not None or  # Railway
+        os.getenv("RAILWAY_ENVIRONMENT_NAME") is not None or
+        os.getenv("DOCKER_CONTAINER") is not None or  # Docker
+        os.getenv("KUBERNETES_SERVICE_HOST") is not None  # Kubernetes
+    )
+
+    if is_cloud:
+        # In cloud: use platform-provided environment variables
+        logger.info("Detected cloud environment, using platform environment variables")
+        return
+
+    # In local development: try to load from .env
     current_dir = os.path.dirname(os.path.abspath(__file__))
     project_root = os.path.dirname(os.path.dirname(current_dir))
     env_path = os.path.join(project_root, ".env")
-    env_example_path = os.path.join(project_root, ".env.example")
 
     if os.path.isfile(env_path):
         load_dotenv(env_path, override=True)
-    elif os.path.isfile(env_example_path):
-        load_dotenv(env_example_path, override=True)
+        logger.info("Loaded environment variables from .env")
+    else:
+        logger.warning("No .env file found in local development")
+
+    # IMPORTANT: Do NOT fallback to .env.example
+    # .env.example is a template only and should never be loaded
 
 
 def get_profile_urls(sheet_client: GoogleSheetsClient, sheet_name: str = "profiles") -> List[str]:
@@ -256,6 +277,37 @@ def is_reply(post: Dict[str, Any]) -> bool:
     return False
 
 
+def is_retweet(post: Dict[str, Any]) -> bool:
+    """
+    Determine if a post is a simple retweet (repost without comments).
+
+    Quote tweets (retweets with comments) are NOT considered retweets
+    and should pass this filter as they contain original content.
+
+    Heuristics:
+        - Check for isRetweet field
+        - Check for retweeted_status field
+        - Check for RT @username pattern in text
+
+    Returns:
+        True if post is a simple retweet, False otherwise
+    """
+    # Check for isRetweet field
+    if post.get("isRetweet") is True:
+        return True
+
+    # Check for retweeted_status field (indicates retweet)
+    if post.get("retweeted_status") or post.get("retweetedStatus"):
+        return True
+
+    # Check text for RT pattern (backup check)
+    text = post.get("text") or post.get("postText") or ""
+    if text.strip().startswith("RT @"):
+        return True
+
+    return False
+
+
 def get_prompt(sheet_client: GoogleSheetsClient, sheet_name: str = "prompts") -> str:
     """
     Retrieve the decision prompt from the prompts worksheet.
@@ -413,6 +465,59 @@ def generate_reply_recommendation(post_text: str, prompt: str) -> str:
         return "No recommendation generated."
 
 
+def generate_post_summary(post_text: str, prompt: str) -> str:
+    """
+    Generate a concise headline-style summary for Telegram notification.
+
+    Args:
+        post_text: Original X post content
+        prompt: Summarization prompt from prompt_inuse worksheet
+
+    Returns:
+        Brief summary (10-15 words) suitable as clickable link text
+    """
+    try:
+        summary = call_chatgpt(prompt, post_text, model="gpt-5.2", max_tokens=30)
+        return summary.strip()
+    except Exception as e:
+        import logging
+        logging.warning(f"Summary generation failed: {e}")
+        # Fallback: Use first 50 characters of post
+        return post_text[:50] + "..." if len(post_text) > 50 else post_text
+
+
+def categorize_post(post_text: str, prompt: str) -> str:
+    """
+    Classify post into one of five predefined categories.
+
+    Args:
+        post_text: Original X post content
+        prompt: Classification prompt from prompt_inuse worksheet
+
+    Returns:
+        Category name: "token_analysis" | "industry_analysis" |
+                       "market_comment" | "tokenomic_comment" | "others"
+    """
+    enhanced_prompt = (
+        f"{prompt}\n\n"
+        "Respond with ONLY ONE of these exact category names: "
+        "token_analysis, industry_analysis, market_comment, tokenomic_comment, others"
+    )
+
+    try:
+        reply = call_chatgpt(enhanced_prompt, post_text, model="gpt-5.2", max_tokens=10)
+        category = reply.strip().lower().replace(" ", "_")
+
+        # Validation with fallback
+        valid_categories = ["token_analysis", "industry_analysis", "market_comment",
+                          "tokenomic_comment", "others"]
+        return category if category in valid_categories else "others"
+    except Exception as e:
+        import logging
+        logging.warning(f"Categorization failed: {e}")
+        return "others"
+
+
 def get_content_provided() -> str:
     """
     Load reference content from a separate Google Sheet (first column).
@@ -471,16 +576,39 @@ def get_prompts_from_sheet() -> Dict[str, str]:
         return {}
 
 
-def format_timestamp(ts: Any) -> str:
+def format_timestamp(ts: Any, created_at: Optional[str] = None) -> str:
     """
-    Convert a millisecond timestamp to a human-readable string.
-    Format: "YYYY-MM-DD HH:MM AM/PM"
+    Convert a timestamp to a human-readable string.
+    Supports both millisecond timestamps and createdAt string format.
+    
+    Args:
+        ts: Millisecond timestamp (int or string).
+        created_at: Optional createdAt string (e.g., "Sat Jan 03 12:55:35 +0000 2026").
+    
+    Returns:
+        Formatted string: "YYYY-MM-DD HH:MM AM/PM" or empty string if parsing fails.
     """
-    try:
-        dt = datetime.fromtimestamp(int(ts) / 1000, tz=timezone.utc)
+    dt = None
+    
+    # Try millisecond timestamp first
+    if ts is not None:
+        try:
+            dt = datetime.fromtimestamp(int(ts) / 1000, tz=timezone.utc)
+        except Exception:
+            pass
+    
+    # Fallback to createdAt string format
+    if dt is None and created_at:
+        try:
+            # Parse format: "Sat Jan 03 12:55:35 +0000 2026"
+            dt = datetime.strptime(created_at, "%a %b %d %H:%M:%S %z %Y")
+            dt = dt.astimezone(timezone.utc)
+        except Exception:
+            pass
+    
+    if dt:
         return dt.strftime("%Y-%m-%d %I:%M %p")
-    except Exception:
-        return ""
+    return ""
 
 
 def write_all_posts_to_testing_sheet(all_posts_data: List[Dict[str, Any]]) -> int:
@@ -554,7 +682,8 @@ def write_all_posts_to_testing_sheet(all_posts_data: List[Dict[str, Any]]) -> in
                 continue
 
             ts_raw = item.get("timestamp") or post.get("timestamp") or ""
-            ts_human = format_timestamp(ts_raw)
+            created_at = post.get("createdAt") or ""
+            ts_human = format_timestamp(ts_raw, created_at)
             post_id = item.get("post_id", "") or post.get("id", "") or post.get("postId", "")
             post_link = (
                 post.get("postUrl")
@@ -651,6 +780,26 @@ def run_scrape_and_filter() -> List[Dict[str, Any]]:
         "Keep it under 100 words (aim for brevity). "
         "Do not include placeholders or ask for more info. Return only the reply text.",
     )
+    summary_prompt = prompt_map.get(
+        "summary_prompt",
+        "You are a professional financial analyst creating concise crypto/blockchain post summaries. "
+        "Read the post and generate a single headline (10-15 words max) capturing the key insight. "
+        'Focus on: specific token names, price levels/predictions, technical analysis findings, industry developments, '
+        'or market sentiment shifts. Be specific and actionable. '
+        'Examples: "BTC breaks $45K resistance with strong volume confirmation" or '
+        '"Ethereum staking yields drop to 3.2% amid validator surge". '
+        "Return ONLY the headline, no quotes or extra text.",
+    )
+    category_prompt = prompt_map.get(
+        "category_prompt",
+        'Classify this crypto/blockchain post into ONE category based on PRIMARY focus: '
+        '1) "token_analysis" - specific token price analysis, charts, technical indicators, price predictions, support/resistance levels '
+        '2) "industry_analysis" - broader blockchain industry trends, regulations, institutional adoption, protocol developments, sector-wide movements '
+        '3) "market_comment" - general market sentiment, macro trends, market psychology, fear/greed indicators, overall market conditions '
+        '4) "tokenomic_comment" - tokenomics analysis, token utility, emission schedules, staking mechanisms, token supply dynamics '
+        '5) "others" - news announcements, educational content, or posts that don\'t fit above categories. '
+        "Respond with ONLY the category name exactly as shown in quotes.",
+    )
 
     matched: List[Dict[str, Any]] = []
     matched_with_profile: List[Dict[str, Any]] = []
@@ -714,10 +863,17 @@ def run_scrape_and_filter() -> List[Dict[str, Any]]:
         if not recent:
             continue  # Skip if no recent posts
 
+        # Filter out replies and simple retweets (safety net for API-level filtering)
         replies = [p for p in recent if is_reply(p)]
         reply_posts += len(replies)
-        # Merge by conversation id and 2-minute window; include originals if no replies found.
-        to_merge = replies if replies else recent
+        retweets = [p for p in recent if is_retweet(p)]
+
+        # Combine filters - exclude both replies and retweets
+        filtered_posts = [p for p in recent if not is_reply(p) and not is_retweet(p)]
+        print(f"   → {len(filtered_posts)} posts after filtering out replies and retweets")
+
+        # Merge by conversation id and 2-minute window
+        to_merge = filtered_posts if filtered_posts else recent
         merged_recent = merge_threaded_posts(to_merge)
         for post in merged_recent:
             text = post.get("text") or post.get("postText") or ""
@@ -728,10 +884,14 @@ def run_scrape_and_filter() -> List[Dict[str, Any]]:
             llm_result = get_llm_decision_with_reason(base_prompt, text)
             is_match = llm_result["decision"]
 
-            # Generate reply recommendation only for matched posts
+            # Generate reply recommendation, summary, and category only for matched posts
             recommendation = ""
+            summary = ""
+            category = "others"
             if is_match:
                 recommendation = generate_reply_recommendation(text, prompt=reply_prompt)
+                summary = generate_post_summary(text, prompt=summary_prompt)
+                category = categorize_post(text, prompt=category_prompt)
 
             # Add to all_posts_with_decisions (for testing sheet)
             all_posts_with_decisions.append({
@@ -753,6 +913,8 @@ def run_scrape_and_filter() -> List[Dict[str, Any]]:
                         "profile_url": url,
                         "post": post,
                         "reply_reco": recommendation,
+                        "summary": summary,
+                        "category": category,
                         "post_id": post.get("id") or post.get("postId") or "",
                         "timestamp": post.get("timestamp"),
                     }
@@ -797,7 +959,7 @@ def run_scrape_and_filter() -> List[Dict[str, Any]]:
             if not any(cell for r in existing for cell in r):
                 ws.append_row(
                     ["profile_url", "post_content", "timestamp", "likes", "reposts", "replies", "bookmarks", "views",
-                     "author", "reply_recommendation", "post_link"],
+                     "author", "reply_recommendation", "post_link", "summary", "category", "telegram_sent_at"],
                     value_input_option="USER_ENTERED",
                 )
                 existing = ws.get_all_values()
@@ -813,9 +975,12 @@ def run_scrape_and_filter() -> List[Dict[str, Any]]:
                 profile_url = (item["profile_url"] or "").strip()
                 text = (post.get("text") or post.get("postText") or "").replace("\n", " ").strip()
                 reply_reco = item.get("reply_reco", "")
-                ts_raw = item.get("timestamp") or ""
+                summary = item.get("summary", "")
+                category = item.get("category", "others")
+                ts_raw = item.get("timestamp") or post.get("timestamp") or ""
+                created_at = post.get("createdAt") or ""
                 ts_str = str(ts_raw) if ts_raw is not None else ""
-                ts_human = format_timestamp(ts_raw)
+                ts_human = format_timestamp(ts_raw, created_at)
                 post_id = item.get("post_id", "")
                 post_link = (
                     post.get("postUrl")
@@ -835,12 +1000,29 @@ def run_scrape_and_filter() -> List[Dict[str, Any]]:
                 if key in existing_pairs:
                     continue
                 rows.append([profile_url, text, ts_human, likes, reposts, replies, bookmarks, views,
-                            author, reply_reco, post_link])
+                            author, reply_reco, post_link, summary, category, ""])
             if rows:
                 ws.append_rows(rows, value_input_option="USER_ENTERED", table_range="A1")
             print(f"Wrote {len(rows)} rows to output sheet '{output_ws_name}'.")
         except Exception as exc:  # noqa: BLE001
             print(f"Failed to write scrape output: {exc}")
+
+    # Send Telegram notification with categorized summaries
+    if os.getenv("ENABLE_TELEGRAM_NOTIFICATIONS", "true").lower() == "true":
+        try:
+            from x_auto.notifications.telegram_bot import send_daily_summary
+            print(f"\n[Telegram] Sending daily summary with {len(matched_with_profile)} posts...")
+            success = send_daily_summary(matched_with_profile)
+            if success:
+                print("[Telegram] Notification sent successfully")
+            else:
+                print("[Telegram] Failed to send notification (see logs above)")
+        except Exception as e:
+            import logging
+            logging.error(f"Telegram notification failed: {e}", exc_info=True)
+            print(f"[Telegram] Error: {e}")
+            # Don't fail the entire job if Telegram fails
+
     return matched
 
 

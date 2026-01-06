@@ -77,6 +77,7 @@ def fetch_posts(
 
     # Build search terms with Twitter query syntax for date filtering
     # Twitter syntax: "from:handle since:YYYY-MM-DD until:YYYY-MM-DD"
+    # Add filters to exclude replies and retweets at API level
     search_terms = []
     for handle in handles:
         if start_date and end_date:
@@ -85,6 +86,13 @@ def fetch_posts(
         else:
             # Simple query without date filtering
             query = f"from:{handle}"
+
+        # Add filters to exclude replies and retweets
+        # -filter:replies = exclude replies
+        # -filter:retweets = exclude native retweets (simple retweets without comments)
+        # Note: This keeps quote tweets (retweets with comments) which are considered original content
+        query += " -filter:replies -filter:retweets"
+
         search_terms.append(query)
 
     # Build payload with searchTerms (instead of twitterHandles)

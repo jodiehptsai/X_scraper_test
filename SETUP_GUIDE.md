@@ -187,7 +187,80 @@ You need to create or identify the following Google Sheets:
 
 ---
 
-## Step 6: Verify Your Setup
+## Step 6: Telegram Bot Setup (Optional)
+
+### Why Telegram notifications?
+Get daily summaries of scraped posts sent directly to your Telegram chat, organized by category with emoji indicators.
+
+### How to set up a Telegram bot:
+
+1. **Create a Telegram Bot**
+   - Open Telegram and search for [@BotFather](https://t.me/botfather)
+   - Start a chat and send `/newbot`
+   - Follow the prompts:
+     - Choose a name for your bot (e.g., "X Piggybacking Bot")
+     - Choose a username (must end in "bot", e.g., "xpiggybacking_bot")
+   - BotFather will send you a token that looks like:
+     ```
+     110201543:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw
+     ```
+   - Copy this token and paste it in `.env` as `TELEGRAM_BOT_TOKEN`
+
+2. **Get Your Chat ID**
+   - Search for [@userinfobot](https://t.me/userinfobot) on Telegram
+   - Start a chat and send any message
+   - The bot will reply with your user information
+   - Copy the **Id** number (e.g., `123456789`)
+   - Paste it in `.env` as `TELEGRAM_CHAT_ID`
+
+3. **Start Your Bot**
+   - Search for your bot on Telegram using the username you created
+   - Click **Start** to activate the bot
+   - This is required before the bot can send you messages
+
+4. **Enable Notifications**
+   - In `.env`, set `ENABLE_TELEGRAM_NOTIFICATIONS=true`
+
+### Test Your Telegram Bot:
+```bash
+# Run the test script
+python test_telegram_notification.py
+```
+
+You should receive two test messages:
+1. A summary with 5 mock posts grouped by category
+2. A "no matches today" message
+
+### Important Notes:
+- **Group Chat Support**: If you want notifications in a group chat:
+  1. Add your bot to the group
+  2. Make it an admin (or allow it to send messages)
+  3. Get the group chat ID using [@getidsbot](https://t.me/getidsbot)
+  4. Use the group chat ID (usually negative, like `-1001234567890`) in `.env`
+
+- **Privacy**: Your bot token is like a password. Keep it secret!
+- **Message Format**: Posts must have `summary` and `category` fields to appear in notifications
+- **Disable Anytime**: Set `ENABLE_TELEGRAM_NOTIFICATIONS=false` to disable
+
+### Troubleshooting:
+
+**"Unauthorized" error:**
+- Check that your bot token is correct
+- Make sure you've started the bot on Telegram
+
+**"Chat not found" error:**
+- Verify your chat ID is correct
+- Make sure you've started a conversation with the bot
+- For group chats, ensure the bot is a member
+
+**"No posts with summary/category":**
+- This is normal if you haven't processed posts yet
+- Posts need `summary` and `category` fields from your pipeline
+- Test with `test_telegram_notification.py` to verify the bot works
+
+---
+
+## Step 7: Verify Your Setup
 
 ### Check your `.env` file:
 ```bash
@@ -197,6 +270,11 @@ You need to create or identify the following Google Sheets:
 ✓ GOOGLE_X_ACCOUNT_ID
 ✓ OPENAI_API_KEY
 ✓ ENABLE_X_POSTING=false (for testing)
+
+# Optional: Telegram notifications
+✓ TELEGRAM_BOT_TOKEN (if using notifications)
+✓ TELEGRAM_CHAT_ID (if using notifications)
+✓ ENABLE_TELEGRAM_NOTIFICATIONS=true (if desired)
 ```
 
 ### Test the setup (dry run):

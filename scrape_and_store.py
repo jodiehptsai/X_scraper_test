@@ -38,6 +38,7 @@ load_dotenv(override=True)
 from scrapers.apify_client import fetch_posts_by_urls
 from x_auto.sheets.client import GoogleSheetsClient, write_scraped_posts
 from x_auto.workflow.pipeline import filter_already_processed
+from x_auto.notifications.telegram_bot import send_daily_summary
 
 
 def get_profile_urls(sheet_client: GoogleSheetsClient, worksheet_name: str) -> List[str]:
@@ -176,6 +177,31 @@ def main():
     print(f"  Total posts scraped: {len(all_posts)}")
     print(f"  New posts stored: {len(new_posts)}")
     print(f"  Duplicates filtered: {len(all_posts) - len(new_posts)}")
+    print()
+
+    # Send Telegram notification if enabled
+    if os.getenv("ENABLE_TELEGRAM_NOTIFICATIONS", "false").lower() == "true":
+        print("[TELEGRAM] Sending notification...")
+        try:
+            # Prepare posts for Telegram (only send new posts with required fields)
+            telegram_posts = []
+            for post in new_posts:
+                # Check if post has the minimum required fields for telegram notification
+                if post.get("summary") and post.get("category"):
+                    telegram_posts.append(post)
+
+            if telegram_posts:
+                success = send_daily_summary(telegram_posts)
+                if success:
+                    print(f"[TELEGRAM] Successfully sent notification for {len(telegram_posts)} posts")
+                else:
+                    print("[TELEGRAM] Failed to send notification (check logs)")
+            else:
+                print(f"[TELEGRAM] Skipped notification (no posts with summary/category)")
+        except Exception as e:
+            print(f"[TELEGRAM] Error sending notification: {e}")
+    else:
+        print("[TELEGRAM] Notifications disabled (set ENABLE_TELEGRAM_NOTIFICATIONS=true to enable)")
     print()
 
 

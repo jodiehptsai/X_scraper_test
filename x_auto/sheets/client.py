@@ -88,16 +88,53 @@ class GoogleSheetsClient:
         # Support unified GOOGLE_SHEET_ID (new) with fallback to GOOGLE_X_ACCOUNT_ID (legacy)
         env_spreadsheet_id = os.getenv("GOOGLE_SHEET_ID") or os.getenv("GOOGLE_X_ACCOUNT_ID")
         spreadsheet_id = spreadsheet_id or env_spreadsheet_id
+
+        # Check for placeholder values
+        PLACEHOLDER_VALUES = [
+            'your_google_sheet_id_here',
+            'your_sheet_id',
+            'REPLACE_WITH_YOUR_SHEET_ID',
+        ]
+
+        if spreadsheet_id and spreadsheet_id in PLACEHOLDER_VALUES:
+            raise RuntimeError(
+                f"❌ GOOGLE_SHEET_ID is set to a placeholder value: '{spreadsheet_id}'\n"
+                f"\n"
+                f"Please set the actual Google Sheet ID:\n"
+                f"  1. Local: Update GOOGLE_SHEET_ID in your .env file\n"
+                f"  2. Railway: Set GOOGLE_SHEET_ID in Railway Dashboard → Variables\n"
+                f"\n"
+                f"To find your Sheet ID:\n"
+                f"  - Open your Google Sheet in browser\n"
+                f"  - Copy the ID from URL: https://docs.google.com/spreadsheets/d/SHEET_ID_HERE/edit\n"
+                f"\n"
+                f"Example: GOOGLE_SHEET_ID=1iXtgaweAlKHITZ_XRCmwIkSfar5YXKzK89ZTdppIlxA"
+            )
+
         try:
             if spreadsheet_id:
                 self.spreadsheet = client.open_by_key(spreadsheet_id)
             else:
                 self.spreadsheet = client.open(spreadsheet_name)
         except gspread.SpreadsheetNotFound as exc:
-            raise RuntimeError(
-                f"Spreadsheet not found. Name='{spreadsheet_name}', "
-                f"ID='{spreadsheet_id or 'unset'}'."
-            ) from exc
+            error_msg = (
+                f"❌ Spreadsheet not found:\n"
+                f"  Name: '{spreadsheet_name}'\n"
+                f"  ID: '{spreadsheet_id or 'unset'}'\n"
+                f"\n"
+                f"Possible causes:\n"
+                f"  1. Sheet ID is incorrect or not set\n"
+                f"  2. Sheet not shared with service account:\n"
+                f"     piggybacking@social-media-tracker-467416.iam.gserviceaccount.com\n"
+                f"  3. Service account credentials are invalid\n"
+                f"\n"
+                f"To fix:\n"
+                f"  - Verify GOOGLE_SHEET_ID in your environment\n"
+                f"  - Share the Google Sheet with the service account email (Editor permission)\n"
+                f"  - Check GOOGLE_SHEETS_CREDENTIALS_BASE64 is correctly set (Railway)\n"
+                f"    or GOOGLE_SERVICE_ACCOUNT_PATH points to valid JSON (local)"
+            )
+            raise RuntimeError(error_msg) from exc
 
     def get_sheet(self, sheet_name: str) -> Any:
         """
