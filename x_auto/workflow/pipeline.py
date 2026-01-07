@@ -12,7 +12,7 @@ from __future__ import annotations
 import os
 from typing import Any, Dict, List
 
-from scrapers.apify_client import fetch_posts
+from x_auto.scrapers.apify_client import fetch_posts
 
 from x_auto.matcher.keyword_matcher import match_keywords, score_matches
 from x_auto.reply_engine.reply_generator import build_reply_text, select_best_template

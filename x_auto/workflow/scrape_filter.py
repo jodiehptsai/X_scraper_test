@@ -23,7 +23,7 @@ from typing import Any, Dict, List, Optional
 import requests
 from dotenv import load_dotenv
 
-from scrapers.apify_client import fetch_posts
+from x_auto.scrapers.apify_client import fetch_posts
 from x_auto.sheets.client import GoogleSheetsClient
 
 

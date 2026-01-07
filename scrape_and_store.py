@@ -35,7 +35,7 @@ from dotenv import load_dotenv
 # Load environment variables
 load_dotenv(override=True)
 
-from scrapers.apify_client import fetch_posts_by_urls
+from x_auto.scrapers.apify_client import fetch_posts_by_urls
 from x_auto.sheets.client import GoogleSheetsClient, write_scraped_posts
 from x_auto.workflow.pipeline import filter_already_processed
 from x_auto.notifications.telegram_bot import send_daily_summary

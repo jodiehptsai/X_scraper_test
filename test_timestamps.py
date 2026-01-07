@@ -4,7 +4,7 @@
 """
 from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
-from scrapers.apify_client import fetch_posts
+from x_auto.scrapers.apify_client import fetch_posts
 
 load_dotenv()
 
