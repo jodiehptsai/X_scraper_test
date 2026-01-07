@@ -170,3 +170,33 @@ def execute_scrape_job_sync():
     except Exception as e:
         logger.error(f"Manual scrape failed: {e}", exc_info=True)
         raise
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="X Scraper Scheduler")
+    parser.add_argument(
+        "--run-now",
+        action="store_true",
+        help="Execute the scrape job immediately instead of waiting for schedule"
+    )
+    args = parser.parse_args()
+
+    if args.run_now:
+        print("Running scrape job immediately...")
+        execute_scrape_job_sync()
+    else:
+        # Start the scheduler normally
+        print("Starting scheduler in background mode...")
+        scheduler = XScraperScheduler()
+        scheduler.add_daily_scrape_job()
+        scheduler.start()
+
+        # Keep the process running
+        import time
+        try:
+            while True:
+                time.sleep(60)
+        except KeyboardInterrupt:
+            scheduler.shutdown()
