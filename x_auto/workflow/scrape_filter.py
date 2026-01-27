@@ -447,7 +447,11 @@ def get_llm_decision_with_reason(prompt: str, post_text: str) -> Dict[str, Any]:
         }
 
 
-def generate_reply_recommendation(post_text: str, prompt: str) -> str:
+def generate_reply_recommendation(
+    post_text: str,
+    prompt: str,
+    rag_index: Optional["RagIndex"] = None,
+) -> str:
     """
     Produce a concise, humanized reply recommendation for a given post.
 
@@ -459,10 +463,84 @@ def generate_reply_recommendation(post_text: str, prompt: str) -> str:
         A short recommendation string suitable as a draft reply.
     """
     try:
-        recommendation = call_chatgpt(prompt, post_text, model="gpt-5.2", max_tokens=120)
+        final_prompt = prompt
+        if rag_index:
+            retrieved_context, _score = rag_index.retrieve_context(post_text)
+            if retrieved_context:
+                from x_auto.rag import build_augmented_prompt
+                final_prompt = build_augmented_prompt(prompt, retrieved_context)
+
+        reply_model = os.getenv("REPLY_MODEL", "gpt-5.1")
+        fallback_model = os.getenv("REPLY_FALLBACK_MODEL", "gpt-4.1-mini")
+        models = [reply_model]
+        if fallback_model and fallback_model not in models:
+            models.append(fallback_model)
+
+        recommendation = ""
+        last_error = None
+        max_tokens = int(os.getenv("REPLY_MAX_TOKENS", "300"))
+        for model in models:
+            try:
+                reply = call_chatgpt(final_prompt, post_text, model=model, max_tokens=max_tokens)
+                if reply and reply.strip():
+                    recommendation = reply
+                    break
+            except Exception as exc:
+                last_error = exc
+                continue
+        if not recommendation and last_error:
+            raise last_error
         return recommendation.strip()
     except Exception:
         return "No recommendation generated."
+
+
+def generate_question_recommendation(
+    post_text: str,
+    prompt: str,
+    rag_index: Optional["RagIndex"] = None,
+) -> str:
+    """
+    Produce a concise, humanized question recommendation for a given post.
+
+    Args:
+        post_text: The original X post text.
+        prompt: Prompt text to guide the question generation.
+
+    Returns:
+        A short question string suitable as a follow-up.
+    """
+    try:
+        final_prompt = prompt
+        if rag_index:
+            retrieved_context, _score = rag_index.retrieve_context(post_text)
+            if retrieved_context:
+                from x_auto.rag import build_augmented_prompt
+                final_prompt = build_augmented_prompt(prompt, retrieved_context)
+
+        question_model = os.getenv("QUESTION_MODEL") or os.getenv("REPLY_MODEL", "gpt-5.1")
+        fallback_model = os.getenv("QUESTION_FALLBACK_MODEL") or os.getenv("REPLY_FALLBACK_MODEL", "gpt-4.1-mini")
+        models = [question_model]
+        if fallback_model and fallback_model not in models:
+            models.append(fallback_model)
+
+        recommendation = ""
+        last_error = None
+        max_tokens = int(os.getenv("QUESTION_MAX_TOKENS", os.getenv("REPLY_MAX_TOKENS", "120")))
+        for model in models:
+            try:
+                reply = call_chatgpt(final_prompt, post_text, model=model, max_tokens=max_tokens)
+                if reply and reply.strip():
+                    recommendation = reply
+                    break
+            except Exception as exc:
+                last_error = exc
+                continue
+        if not recommendation and last_error:
+            raise last_error
+        return recommendation.strip()
+    except Exception:
+        return "No question generated."
 
 
 def generate_post_summary(post_text: str, prompt: str) -> str:
@@ -560,7 +638,7 @@ def get_prompts_from_sheet() -> Dict[str, str]:
     prompts_sheet_id = os.getenv("GOOGLE_SHEET_ID") or os.getenv("GOOGLE_X_PROMPTS_SHEET_ID")
     if not prompts_sheet_id:
         return {}
-    worksheet_name = os.getenv("GOOGLE_WS_PROMPTS") or os.getenv("GOOGLE_X_PROMPTS_WORKSHEET", "prompts")
+    worksheet_name = os.getenv("GOOGLE_WS_PROMPTS") or os.getenv("GOOGLE_X_PROMPTS_WORKSHEET", "prompt_inuse")
     try:
         client = GoogleSheetsClient(spreadsheet_name="prompts_sheet", spreadsheet_id=prompts_sheet_id)
         ws = client.get_sheet(worksheet_name)
@@ -571,6 +649,13 @@ def get_prompts_from_sheet() -> Dict[str, str]:
             prompt_val = str(row.get("prompt") or "").strip()
             if name and prompt_val:
                 prompt_map[name] = prompt_val
+            # Support "wide" sheets where each prompt is a column in a single row.
+            if not name and not prompt_val and row:
+                for key, value in row.items():
+                    k = str(key or "").strip()
+                    v = str(value or "").strip()
+                    if k and v:
+                        prompt_map[k] = v
         return prompt_map
     except Exception:
         return {}
@@ -654,10 +739,15 @@ def write_all_posts_to_testing_sheet(all_posts_data: List[Dict[str, Any]]) -> in
                 "scraped_at", "profile_url", "author", "post_content", "timestamp",
                 "likes", "reposts", "replies", "bookmarks", "views",
                 "llm_decision", "llm_reason", "prompt_used",
-                "reply_recommendation", "post_link"
+                "reply_recommendation", "post_link", "question_recommendation"
             ]
             ws.append_row(headers, value_input_option="USER_ENTERED")
             existing = ws.get_all_values()
+        else:
+            headers = existing[0] if existing else []
+            if "question_recommendation" not in headers:
+                headers = list(headers) + ["question_recommendation"]
+                ws.update("A1", [headers])
 
         # Build deduplication set
         existing_keys = set()
@@ -703,12 +793,13 @@ def write_all_posts_to_testing_sheet(all_posts_data: List[Dict[str, Any]]) -> in
             llm_reason = item.get("llm_reason", "")
             prompt_used = item.get("prompt_used", "match_prompt")
             reply_reco = item.get("reply_reco", "")
+            question_reco = item.get("question_reco", "")
 
             rows.append([
                 scraped_at, profile_url, author, text, ts_human,
                 likes, reposts, replies_count, bookmarks, views,
                 llm_decision, llm_reason, prompt_used,
-                reply_reco, post_link
+                reply_reco, post_link, question_reco
             ])
 
         # Write rows
@@ -777,8 +868,14 @@ def run_scrape_and_filter() -> List[Dict[str, Any]]:
         "You craft concise, human replies for a professional liquid fund account. "
         "Read the user's post and propose a short, friendly reply that adds value, "
         "acknowledges the topic, and avoids hype. Use relevant domain knowledge if helpful. "
+        "Feel free to ask questions if the user seem to have deeper insights into the topic. "
         "Keep it under 100 words (aim for brevity). "
-        "Do not include placeholders or ask for more info. Return only the reply text.",
+        "Do not include hyphens/dashes/— or ask for more info. Return only the reply text.",
+    )
+    question_prompt = prompt_map.get(
+        "question_prompt",
+        "Write one concise, natural question to ask the author. It should be relevant and invite clarification "
+        "or deeper insight. Return only the question text.",
     )
     summary_prompt = prompt_map.get(
         "summary_prompt",
@@ -800,6 +897,18 @@ def run_scrape_and_filter() -> List[Dict[str, Any]]:
         '5) "others" - news announcements, educational content, or posts that don\'t fit above categories. '
         "Respond with ONLY the category name exactly as shown in quotes.",
     )
+
+    rag_index = None
+    if os.getenv("ENABLE_RAG", "true").lower() == "true":
+        try:
+            from x_auto.rag import load_rag_index
+            rag_index = load_rag_index()
+            if rag_index:
+                print("[RAG] Index loaded. Reply generation will use retrieval when relevant.")
+            else:
+                print("[RAG] No index available. Reply generation will use the base prompt.")
+        except Exception as exc:
+            print(f"[RAG] Initialization failed, continuing without RAG: {exc}")
 
     matched: List[Dict[str, Any]] = []
     matched_with_profile: List[Dict[str, Any]] = []
@@ -884,12 +993,22 @@ def run_scrape_and_filter() -> List[Dict[str, Any]]:
             llm_result = get_llm_decision_with_reason(base_prompt, text)
             is_match = llm_result["decision"]
 
-            # Generate reply recommendation, summary, and category only for matched posts
+            # Generate reply recommendation, question, summary, and category only for matched posts
             recommendation = ""
+            question = ""
             summary = ""
             category = "others"
             if is_match:
-                recommendation = generate_reply_recommendation(text, prompt=reply_prompt)
+                recommendation = generate_reply_recommendation(
+                    text,
+                    prompt=reply_prompt,
+                    rag_index=rag_index,
+                )
+                question = generate_question_recommendation(
+                    text,
+                    prompt=question_prompt,
+                    rag_index=rag_index,
+                )
                 summary = generate_post_summary(text, prompt=summary_prompt)
                 category = categorize_post(text, prompt=category_prompt)
 
@@ -901,6 +1020,7 @@ def run_scrape_and_filter() -> List[Dict[str, Any]]:
                 "llm_reason": llm_result["reason"],
                 "prompt_used": "match_prompt",
                 "reply_reco": recommendation,
+                "question_reco": question,
                 "post_id": post.get("id") or post.get("postId") or "",
                 "timestamp": post.get("timestamp"),
             })
@@ -913,6 +1033,7 @@ def run_scrape_and_filter() -> List[Dict[str, Any]]:
                         "profile_url": url,
                         "post": post,
                         "reply_reco": recommendation,
+                        "question_reco": question,
                         "summary": summary,
                         "category": category,
                         "post_id": post.get("id") or post.get("postId") or "",
@@ -959,10 +1080,18 @@ def run_scrape_and_filter() -> List[Dict[str, Any]]:
             if not any(cell for r in existing for cell in r):
                 ws.append_row(
                     ["profile_url", "post_content", "timestamp", "likes", "reposts", "replies", "bookmarks", "views",
-                     "author", "reply_recommendation", "post_link", "summary", "category", "telegram_sent_at"],
+                     "author", "reply_recommendation", "question_recommendation", "post_link", "summary", "category",
+                     "telegram_sent_at"],
                     value_input_option="USER_ENTERED",
                 )
                 existing = ws.get_all_values()
+            else:
+                headers = existing[0] if existing else []
+                if "question_recommendation" not in headers:
+                    headers = list(headers)
+                    insert_at = headers.index("reply_recommendation") + 1 if "reply_recommendation" in headers else len(headers)
+                    headers.insert(insert_at, "question_recommendation")
+                    ws.update("A1", [headers])
 
             existing_pairs = set()
             for row in existing[1:]:
@@ -975,6 +1104,7 @@ def run_scrape_and_filter() -> List[Dict[str, Any]]:
                 profile_url = (item["profile_url"] or "").strip()
                 text = (post.get("text") or post.get("postText") or "").replace("\n", " ").strip()
                 reply_reco = item.get("reply_reco", "")
+                question_reco = item.get("question_reco", "")
                 summary = item.get("summary", "")
                 category = item.get("category", "others")
                 ts_raw = item.get("timestamp") or post.get("timestamp") or ""
@@ -1000,7 +1130,7 @@ def run_scrape_and_filter() -> List[Dict[str, Any]]:
                 if key in existing_pairs:
                     continue
                 rows.append([profile_url, text, ts_human, likes, reposts, replies, bookmarks, views,
-                            author, reply_reco, post_link, summary, category, ""])
+                            author, reply_reco, question_reco, post_link, summary, category, ""])
             if rows:
                 ws.append_rows(rows, value_input_option="USER_ENTERED", table_range="A1")
             print(f"Wrote {len(rows)} rows to output sheet '{output_ws_name}'.")
