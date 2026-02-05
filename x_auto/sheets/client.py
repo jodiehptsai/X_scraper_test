@@ -53,32 +53,88 @@ class GoogleSheetsClient:
     """
 
     def __init__(self, spreadsheet_name: str, spreadsheet_id: str | None = None):
-        service_account_path = os.getenv("GOOGLE_SERVICE_ACCOUNT_PATH")
-        if not service_account_path:
-            raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_PATH is required but missing.")
+        # Option 1: Base64 environment variable (Railway/cloud deployment)
+        creds_base64 = os.getenv("GOOGLE_SHEETS_CREDENTIALS_BASE64")
 
-        credentials_path = Path(service_account_path)
-        if not credentials_path.is_file():
-            raise RuntimeError(f"Service account file not found at {credentials_path}")
+        if creds_base64:
+            import base64
+            import json
+            creds_json = base64.b64decode(creds_base64).decode('utf-8')
+            creds_dict = json.loads(creds_json)
+            credentials = Credentials.from_service_account_info(
+                creds_dict,
+                scopes=DEFAULT_SCOPES
+            )
+        else:
+            # Option 2: File path (local development)
+            service_account_path = os.getenv("GOOGLE_SERVICE_ACCOUNT_PATH")
+            if not service_account_path:
+                raise RuntimeError(
+                    "Either GOOGLE_SHEETS_CREDENTIALS_BASE64 or "
+                    "GOOGLE_SERVICE_ACCOUNT_PATH is required but both are missing."
+                )
 
-        credentials = Credentials.from_service_account_file(
-            str(credentials_path),
-            scopes=DEFAULT_SCOPES,
-        )
+            credentials_path = Path(service_account_path)
+            if not credentials_path.is_file():
+                raise RuntimeError(f"Service account file not found at {credentials_path}")
+
+            credentials = Credentials.from_service_account_file(
+                str(credentials_path),
+                scopes=DEFAULT_SCOPES,
+            )
+
         client = gspread.authorize(credentials)
 
-        env_spreadsheet_id = os.getenv("GOOGLE_X_ACCOUNT_ID")
+        # Support unified GOOGLE_SHEET_ID (new) with fallback to GOOGLE_X_ACCOUNT_ID (legacy)
+        env_spreadsheet_id = os.getenv("GOOGLE_SHEET_ID") or os.getenv("GOOGLE_X_ACCOUNT_ID")
         spreadsheet_id = spreadsheet_id or env_spreadsheet_id
+
+        # Check for placeholder values
+        PLACEHOLDER_VALUES = [
+            'your_google_sheet_id_here',
+            'your_sheet_id',
+            'REPLACE_WITH_YOUR_SHEET_ID',
+        ]
+
+        if spreadsheet_id and spreadsheet_id in PLACEHOLDER_VALUES:
+            raise RuntimeError(
+                f"❌ GOOGLE_SHEET_ID is set to a placeholder value: '{spreadsheet_id}'\n"
+                f"\n"
+                f"Please set the actual Google Sheet ID:\n"
+                f"  1. Local: Update GOOGLE_SHEET_ID in your .env file\n"
+                f"  2. Railway: Set GOOGLE_SHEET_ID in Railway Dashboard → Variables\n"
+                f"\n"
+                f"To find your Sheet ID:\n"
+                f"  - Open your Google Sheet in browser\n"
+                f"  - Copy the ID from URL: https://docs.google.com/spreadsheets/d/SHEET_ID_HERE/edit\n"
+                f"\n"
+                f"Example: GOOGLE_SHEET_ID=1iXtgaweAlKHITZ_XRCmwIkSfar5YXKzK89ZTdppIlxA"
+            )
+
         try:
             if spreadsheet_id:
                 self.spreadsheet = client.open_by_key(spreadsheet_id)
             else:
                 self.spreadsheet = client.open(spreadsheet_name)
         except gspread.SpreadsheetNotFound as exc:
-            raise RuntimeError(
-                f"Spreadsheet not found. Name='{spreadsheet_name}', "
-                f"ID='{spreadsheet_id or 'unset'}'."
-            ) from exc
+            error_msg = (
+                f"❌ Spreadsheet not found:\n"
+                f"  Name: '{spreadsheet_name}'\n"
+                f"  ID: '{spreadsheet_id or 'unset'}'\n"
+                f"\n"
+                f"Possible causes:\n"
+                f"  1. Sheet ID is incorrect or not set\n"
+                f"  2. Sheet not shared with service account:\n"
+                f"     piggybacking@social-media-tracker-467416.iam.gserviceaccount.com\n"
+                f"  3. Service account credentials are invalid\n"
+                f"\n"
+                f"To fix:\n"
+                f"  - Verify GOOGLE_SHEET_ID in your environment\n"
+                f"  - Share the Google Sheet with the service account email (Editor permission)\n"
+                f"  - Check GOOGLE_SHEETS_CREDENTIALS_BASE64 is correctly set (Railway)\n"
+                f"    or GOOGLE_SERVICE_ACCOUNT_PATH points to valid JSON (local)"
+            )
+            raise RuntimeError(error_msg) from exc
 
     def get_sheet(self, sheet_name: str) -> Any:
         """
@@ -159,3 +215,80 @@ def write_review_queue(sheet_client: GoogleSheetsClient, sheet_name: str, rows: 
     Placeholder for writing review queue entries; to be implemented with project-specific parsing.
     """
     raise NotImplementedError("Review queue writing is not yet implemented.")
+
+
+def write_scraped_posts(
+    sheet_client: GoogleSheetsClient,
+    sheet_name: str,
+    posts: List[Dict[str, Any]],
+    ensure_headers: bool = True
+) -> int:
+    """
+    Write scraped posts to a Google Sheet with proper column formatting.
+
+    Args:
+        sheet_client: Authenticated GoogleSheetsClient instance.
+        sheet_name: Name of the worksheet to write to.
+        posts: List of post dictionaries from Apify scraper.
+        ensure_headers: If True, adds headers if the sheet is empty.
+
+    Returns:
+        Number of posts written to the sheet.
+
+    Raises:
+        RuntimeError: If the worksheet cannot be accessed.
+
+    Column structure:
+        post_id, author_username, author_name, text, created_at,
+        url, likes, retweets, replies, views, scraped_at
+    """
+    if not posts:
+        return 0
+
+    worksheet = sheet_client.get_sheet(sheet_name)
+
+    # Check if we need to add headers
+    if ensure_headers:
+        try:
+            existing_data = worksheet.get_all_values()
+            if not existing_data or not existing_data[0]:
+                # Sheet is empty, add headers
+                headers = [
+                    "post_id", "author_username", "author_name", "text",
+                    "created_at", "url", "likes", "retweets", "replies",
+                    "views", "scraped_at"
+                ]
+                worksheet.append_row(headers, value_input_option="USER_ENTERED")
+        except Exception as e:
+            raise RuntimeError(f"Failed to check/add headers: {e}")
+
+    # Prepare rows from posts
+    from datetime import datetime
+    scraped_at = datetime.now().isoformat()
+
+    rows_to_add = []
+    for post in posts:
+        author = post.get("author", {})
+        row = [
+            post.get("id", ""),
+            author.get("userName", ""),
+            author.get("name", ""),
+            post.get("text", ""),
+            post.get("createdAt", ""),
+            post.get("url", ""),
+            post.get("likes", 0),
+            post.get("retweetCount", 0),
+            post.get("replyCount", 0),
+            post.get("viewCount", 0),
+            scraped_at
+        ]
+        rows_to_add.append(row)
+
+    # Batch write all rows
+    if rows_to_add:
+        try:
+            worksheet.append_rows(rows_to_add, value_input_option="USER_ENTERED")
+        except Exception as e:
+            raise RuntimeError(f"Failed to write posts to sheet: {e}")
+
+    return len(rows_to_add)

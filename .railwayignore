@@ -1,0 +1,76 @@
+# Environment files (contains secrets)
+.env
+.env.local
+.env.*.local
+
+# Service account credentials (use GOOGLE_SHEETS_CREDENTIALS_BASE64 instead)
+*.json
+!package.json
+!package-lock.json
+
+# Git repository
+.git
+.gitignore
+.gitattributes
+
+# Python cache and build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+ENV/
+env/
+.venv
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+tests/
+test_*.py
+*_test.py
+
+# Documentation
+docs/
+*.md
+!README.md
+
+# Logs
+*.log
+
+# Personal notes
+todo.md
+notes.md
+
+# POC and experimental files
+poc_*.py
+experiment_*.py
+temp_*.py
+/tmp/

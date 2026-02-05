@@ -23,16 +23,43 @@ from typing import Any, Dict, List, Optional
 import requests
 from dotenv import load_dotenv
 
-from scrapers.apify_client import fetch_posts
+from x_auto.scrapers.apify_client import fetch_posts
 from x_auto.sheets.client import GoogleSheetsClient
 
 
 def load_env() -> None:
-    """Load environment variables from .env if present."""
-    if os.path.isfile(".env"):
-        load_dotenv(".env")
-    elif os.path.isfile(".env.example"):
-        load_dotenv(".env.example")
+    """
+    Load environment variables from .env if present.
+
+    In cloud environments (Railway, Docker, etc.), skip loading .env files
+    since environment variables are managed by the platform.
+    """
+    # Check if running in a cloud environment
+    is_cloud = (
+        os.getenv("RAILWAY_ENVIRONMENT") is not None or  # Railway
+        os.getenv("RAILWAY_ENVIRONMENT_NAME") is not None or
+        os.getenv("DOCKER_CONTAINER") is not None or  # Docker
+        os.getenv("KUBERNETES_SERVICE_HOST") is not None  # Kubernetes
+    )
+
+    if is_cloud:
+        # In cloud: use platform-provided environment variables
+        print("INFO: Detected cloud environment, using platform environment variables")
+        return
+
+    # In local development: try to load from .env
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    project_root = os.path.dirname(os.path.dirname(current_dir))
+    env_path = os.path.join(project_root, ".env")
+
+    if os.path.isfile(env_path):
+        load_dotenv(env_path, override=True)
+        print("INFO: Loaded environment variables from .env")
+    else:
+        print("WARNING: No .env file found in local development")
+
+    # IMPORTANT: Do NOT fallback to .env.example
+    # .env.example is a template only and should never be loaded
 
 
 def get_profile_urls(sheet_client: GoogleSheetsClient, sheet_name: str = "profiles") -> List[str]:
@@ -46,7 +73,8 @@ def get_profile_urls(sheet_client: GoogleSheetsClient, sheet_name: str = "profil
     Returns:
         List of validated X profile URLs.
     """
-    worksheet_name = os.getenv("GOOGLE_X_PROFILES_WORKSHEET", sheet_name)
+    # New env var with fallback to legacy
+    worksheet_name = os.getenv("GOOGLE_WS_PROFILES") or os.getenv("GOOGLE_X_PROFILES_WORKSHEET", sheet_name)
     try:
         worksheet = sheet_client.get_sheet(worksheet_name)
     except RuntimeError:
@@ -94,15 +122,26 @@ def get_profile_urls(sheet_client: GoogleSheetsClient, sheet_name: str = "profil
     try:
         records = worksheet.get_all_records()
         for row in records:
-            handle = row.get("X(handle)") or row.get("X handle") or row.get("handle")
+            handle = row.get("X(handle)") or row.get("X handle") or row.get("handle") or row.get("Handle")
             link = row.get("X(link)") or row.get("X link") or row.get("link")
-            handle = (handle or "").strip().lstrip("@")
+            handle_str = (handle or "").strip()
             link = (link or "").strip()
 
             if link:
                 urls.extend(normalize_links(link))
-            if handle:
-                urls.append(f"https://x.com/{handle}")
+            if handle_str:
+                # Split multiple handles by newlines, commas, spaces, pipes, or slashes
+                handle_parts = re.split(r'[\n,|/]+', handle_str)
+                for h in handle_parts:
+                    # Clean each handle: remove @, whitespace, and parenthetical notes
+                    h = h.strip().lstrip("@")
+                    # Remove anything in parentheses (e.g., "(founder)")
+                    h = re.sub(r'\s*\([^)]*\)\s*', '', h).strip()
+                    # Filter out invalid handles
+                    if h and h.lower() not in {"n/a", "na", "https:", "http:", "x.com", "twitter.com"}:
+                        # Validate handle format (alphanumeric, underscore, no spaces/special chars)
+                        if re.match(r'^[a-zA-Z0-9_]+$', h):
+                            urls.append(f"https://x.com/{h}")
     except Exception:
         records = None
 
@@ -135,19 +174,35 @@ def is_recent_post(post: Dict[str, Any], days: int = 30) -> bool:
     Check whether a post's timestamp falls within the last N days.
 
     Args:
-        post: Post dictionary (expects a 'timestamp' field in milliseconds).
+        post: Post dictionary (expects a 'timestamp' field in milliseconds or 'createdAt' string).
         days: Window size in days to treat as recent.
 
     Returns:
         True if timestamp is within the window; False otherwise.
     """
+    # Try timestamp field first (milliseconds)
     ts = post.get("timestamp")
-    if ts is None:
+    if ts is not None:
+        try:
+            ts_dt = datetime.fromtimestamp(int(ts) / 1000, tz=timezone.utc)
+        except Exception:
+            ts_dt = None
+    else:
+        # Fallback to createdAt string (e.g., "Sat Jan 03 12:55:35 +0000 2026")
+        created_at = post.get("createdAt")
+        if not created_at:
+            return False
+        try:
+            # Parse format: "Sat Jan 03 12:55:35 +0000 2026"
+            ts_dt = datetime.strptime(created_at, "%a %b %d %H:%M:%S %z %Y")
+            # Convert to UTC
+            ts_dt = ts_dt.astimezone(timezone.utc)
+        except Exception:
+            return False
+
+    if ts_dt is None:
         return False
-    try:
-        ts_dt = datetime.fromtimestamp(int(ts) / 1000, tz=timezone.utc)
-    except Exception:
-        return False
+
     cutoff = datetime.now(tz=timezone.utc) - timedelta(days=days)
     return ts_dt >= cutoff
 
@@ -222,6 +277,37 @@ def is_reply(post: Dict[str, Any]) -> bool:
     return False
 
 
+def is_retweet(post: Dict[str, Any]) -> bool:
+    """
+    Determine if a post is a simple retweet (repost without comments).
+
+    Quote tweets (retweets with comments) are NOT considered retweets
+    and should pass this filter as they contain original content.
+
+    Heuristics:
+        - Check for isRetweet field
+        - Check for retweeted_status field
+        - Check for RT @username pattern in text
+
+    Returns:
+        True if post is a simple retweet, False otherwise
+    """
+    # Check for isRetweet field
+    if post.get("isRetweet") is True:
+        return True
+
+    # Check for retweeted_status field (indicates retweet)
+    if post.get("retweeted_status") or post.get("retweetedStatus"):
+        return True
+
+    # Check text for RT pattern (backup check)
+    text = post.get("text") or post.get("postText") or ""
+    if text.strip().startswith("RT @"):
+        return True
+
+    return False
+
+
 def get_prompt(sheet_client: GoogleSheetsClient, sheet_name: str = "prompts") -> str:
     """
     Retrieve the decision prompt from the prompts worksheet.
@@ -255,7 +341,7 @@ def get_prompt(sheet_client: GoogleSheetsClient, sheet_name: str = "prompts") ->
 def call_chatgpt(
     prompt: str,
     content: str,
-    model: str = "gpt-4o-mini",
+    model: str = "gpt-5.2",
     max_tokens: int = 50,
 ) -> str:
     """
@@ -277,17 +363,31 @@ def call_chatgpt(
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY is required for ChatGPT calls.")
 
-    body = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": prompt},
-            {"role": "user", "content": content},
-        ],
-        "max_tokens": max_tokens,
-    }
+    # Strip whitespace and ensure proper encoding
+    api_key = api_key.strip()
+
+    # GPT-5.x models use max_completion_tokens instead of max_tokens
+    if model.startswith("gpt-5"):
+        body = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": content},
+            ],
+            "max_completion_tokens": max_tokens,
+        }
+    else:
+        body = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": content},
+            ],
+            "max_tokens": max_tokens,
+        }
     headers = {
         "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
+        "Content-Type": "application/json; charset=utf-8",
     }
     resp = requests.post("https://api.openai.com/v1/chat/completions", json=body, headers=headers, timeout=30)
     if not resp.ok:
@@ -311,7 +411,47 @@ def is_match_via_llm(prompt: str, post_text: str) -> bool:
     return "yes" in reply.lower()
 
 
-def generate_reply_recommendation(post_text: str, prompt: str) -> str:
+def get_llm_decision_with_reason(prompt: str, post_text: str) -> Dict[str, Any]:
+    """
+    Get both decision and reason from LLM in a single call.
+
+    Args:
+        prompt: Decision prompt.
+        post_text: Text of the post.
+
+    Returns:
+        Dict with 'decision' (bool), 'decision_text' (str), and 'reason' (str).
+    """
+    enhanced_prompt = (
+        f"{prompt}\n\n"
+        "After your yes/no decision, provide a brief reason (1 sentence) for your decision. "
+        "Format: 'yes' or 'no', then reason on next line."
+    )
+
+    try:
+        reply = call_chatgpt(enhanced_prompt, post_text, model="gpt-5.2", max_tokens=80)
+        lines = reply.strip().split('\n', 1)
+        decision_text = lines[0].strip().lower()
+        reason = lines[1].strip() if len(lines) > 1 else "No reason provided"
+
+        return {
+            "decision": "yes" in decision_text,
+            "decision_text": 1 if "yes" in decision_text else 0,
+            "reason": reason
+        }
+    except Exception as e:
+        return {
+            "decision": False,
+            "decision_text": 0,
+            "reason": f"Error getting LLM decision: {str(e)}"
+        }
+
+
+def generate_reply_recommendation(
+    post_text: str,
+    prompt: str,
+    rag_index: Optional["RagIndex"] = None,
+) -> str:
     """
     Produce a concise, humanized reply recommendation for a given post.
 
@@ -323,10 +463,137 @@ def generate_reply_recommendation(post_text: str, prompt: str) -> str:
         A short recommendation string suitable as a draft reply.
     """
     try:
-        recommendation = call_chatgpt(prompt, post_text, model="gpt-4o-mini", max_tokens=120)
+        final_prompt = prompt
+        if rag_index:
+            retrieved_context, _score = rag_index.retrieve_context(post_text)
+            if retrieved_context:
+                from x_auto.rag import build_augmented_prompt
+                final_prompt = build_augmented_prompt(prompt, retrieved_context)
+
+        reply_model = os.getenv("REPLY_MODEL", "gpt-5.1")
+        fallback_model = os.getenv("REPLY_FALLBACK_MODEL", "gpt-4.1-mini")
+        models = [reply_model]
+        if fallback_model and fallback_model not in models:
+            models.append(fallback_model)
+
+        recommendation = ""
+        last_error = None
+        max_tokens = int(os.getenv("REPLY_MAX_TOKENS", "300"))
+        for model in models:
+            try:
+                reply = call_chatgpt(final_prompt, post_text, model=model, max_tokens=max_tokens)
+                if reply and reply.strip():
+                    recommendation = reply
+                    break
+            except Exception as exc:
+                last_error = exc
+                continue
+        if not recommendation and last_error:
+            raise last_error
         return recommendation.strip()
     except Exception:
         return "No recommendation generated."
+
+
+def generate_question_recommendation(
+    post_text: str,
+    prompt: str,
+    rag_index: Optional["RagIndex"] = None,
+) -> str:
+    """
+    Produce a concise, humanized question recommendation for a given post.
+
+    Args:
+        post_text: The original X post text.
+        prompt: Prompt text to guide the question generation.
+
+    Returns:
+        A short question string suitable as a follow-up.
+    """
+    try:
+        final_prompt = prompt
+        if rag_index:
+            retrieved_context, _score = rag_index.retrieve_context(post_text)
+            if retrieved_context:
+                from x_auto.rag import build_augmented_prompt
+                final_prompt = build_augmented_prompt(prompt, retrieved_context)
+
+        question_model = os.getenv("QUESTION_MODEL") or os.getenv("REPLY_MODEL", "gpt-5.1")
+        fallback_model = os.getenv("QUESTION_FALLBACK_MODEL") or os.getenv("REPLY_FALLBACK_MODEL", "gpt-4.1-mini")
+        models = [question_model]
+        if fallback_model and fallback_model not in models:
+            models.append(fallback_model)
+
+        recommendation = ""
+        last_error = None
+        max_tokens = int(os.getenv("QUESTION_MAX_TOKENS", os.getenv("REPLY_MAX_TOKENS", "120")))
+        for model in models:
+            try:
+                reply = call_chatgpt(final_prompt, post_text, model=model, max_tokens=max_tokens)
+                if reply and reply.strip():
+                    recommendation = reply
+                    break
+            except Exception as exc:
+                last_error = exc
+                continue
+        if not recommendation and last_error:
+            raise last_error
+        return recommendation.strip()
+    except Exception:
+        return "No question generated."
+
+
+def generate_post_summary(post_text: str, prompt: str) -> str:
+    """
+    Generate a concise headline-style summary for Telegram notification.
+
+    Args:
+        post_text: Original X post content
+        prompt: Summarization prompt from prompt_inuse worksheet
+
+    Returns:
+        Brief summary (10-15 words) suitable as clickable link text
+    """
+    try:
+        summary = call_chatgpt(prompt, post_text, model="gpt-5.2", max_tokens=30)
+        return summary.strip()
+    except Exception as e:
+        import logging
+        logging.warning(f"Summary generation failed: {e}")
+        # Fallback: Use first 50 characters of post
+        return post_text[:50] + "..." if len(post_text) > 50 else post_text
+
+
+def categorize_post(post_text: str, prompt: str) -> str:
+    """
+    Classify post into one of five predefined categories.
+
+    Args:
+        post_text: Original X post content
+        prompt: Classification prompt from prompt_inuse worksheet
+
+    Returns:
+        Category name: "token_analysis" | "industry_analysis" |
+                       "market_comment" | "tokenomic_comment" | "others"
+    """
+    enhanced_prompt = (
+        f"{prompt}\n\n"
+        "Respond with ONLY ONE of these exact category names: "
+        "token_analysis, industry_analysis, market_comment, tokenomic_comment, others"
+    )
+
+    try:
+        reply = call_chatgpt(enhanced_prompt, post_text, model="gpt-5.2", max_tokens=10)
+        category = reply.strip().lower().replace(" ", "_")
+
+        # Validation with fallback
+        valid_categories = ["token_analysis", "industry_analysis", "market_comment",
+                          "tokenomic_comment", "others"]
+        return category if category in valid_categories else "others"
+    except Exception as e:
+        import logging
+        logging.warning(f"Categorization failed: {e}")
+        return "others"
 
 
 def get_content_provided() -> str:
@@ -367,10 +634,11 @@ def get_prompts_from_sheet() -> Dict[str, str]:
     Expects columns: name, prompt (first row as header). Returns a mapping.
     Falls back to defaults if env not set or sheet unreadable.
     """
-    prompts_sheet_id = os.getenv("GOOGLE_X_PROMPTS_SHEET_ID")
+    # New env var with fallback to legacy
+    prompts_sheet_id = os.getenv("GOOGLE_SHEET_ID") or os.getenv("GOOGLE_X_PROMPTS_SHEET_ID")
     if not prompts_sheet_id:
         return {}
-    worksheet_name = os.getenv("GOOGLE_X_PROMPTS_WORKSHEET", "prompts")
+    worksheet_name = os.getenv("GOOGLE_WS_PROMPTS") or os.getenv("GOOGLE_X_PROMPTS_WORKSHEET", "prompt_inuse")
     try:
         client = GoogleSheetsClient(spreadsheet_name="prompts_sheet", spreadsheet_id=prompts_sheet_id)
         ws = client.get_sheet(worksheet_name)
@@ -381,19 +649,171 @@ def get_prompts_from_sheet() -> Dict[str, str]:
             prompt_val = str(row.get("prompt") or "").strip()
             if name and prompt_val:
                 prompt_map[name] = prompt_val
+            # Support "wide" sheets where each prompt is a column in a single row.
+            if not name and not prompt_val and row:
+                for key, value in row.items():
+                    k = str(key or "").strip()
+                    v = str(value or "").strip()
+                    if k and v:
+                        prompt_map[k] = v
         return prompt_map
     except Exception:
         return {}
 
 
-def format_timestamp(ts: Any) -> str:
+def format_timestamp(ts: Any, created_at: Optional[str] = None) -> str:
     """
-    Convert a millisecond timestamp to an ISO8601 string (UTC).
+    Convert a timestamp to a human-readable string.
+    Supports both millisecond timestamps and createdAt string format.
+    
+    Args:
+        ts: Millisecond timestamp (int or string).
+        created_at: Optional createdAt string (e.g., "Sat Jan 03 12:55:35 +0000 2026").
+    
+    Returns:
+        Formatted string: "YYYY-MM-DD HH:MM AM/PM" or empty string if parsing fails.
     """
+    dt = None
+    
+    # Try millisecond timestamp first
+    if ts is not None:
+        try:
+            dt = datetime.fromtimestamp(int(ts) / 1000, tz=timezone.utc)
+        except Exception:
+            pass
+    
+    # Fallback to createdAt string format
+    if dt is None and created_at:
+        try:
+            # Parse format: "Sat Jan 03 12:55:35 +0000 2026"
+            dt = datetime.strptime(created_at, "%a %b %d %H:%M:%S %z %Y")
+            dt = dt.astimezone(timezone.utc)
+        except Exception:
+            pass
+    
+    if dt:
+        return dt.strftime("%Y-%m-%d %I:%M %p")
+    return ""
+
+
+def write_all_posts_to_testing_sheet(all_posts_data: List[Dict[str, Any]]) -> int:
+    """
+    Write ALL scraped posts (including filtered out ones) to all_post worksheet for analysis.
+
+    Args:
+        all_posts_data: List of post dictionaries with LLM decisions
+
+    Returns:
+        Number of rows written
+    """
+    if not all_posts_data:
+        return 0
+
+    # New env var with fallback to legacy
+    testing_sheet_id = os.getenv("GOOGLE_SHEET_ID") or os.getenv("GOOGLE_X_TESTING_SHEET_ID")
+    testing_ws_name = os.getenv("GOOGLE_WS_ALL_POST") or os.getenv("GOOGLE_X_TESTING_WORKSHEET", "all_post")
+
+    if not testing_sheet_id:
+        print("GOOGLE_SHEET_ID not configured, skipping all_post sheet write")
+        return 0
+
     try:
-        return datetime.fromtimestamp(int(ts) / 1000, tz=timezone.utc).isoformat()
-    except Exception:
-        return ""
+        testing_client = GoogleSheetsClient(
+            spreadsheet_name="Testing Sheet",
+            spreadsheet_id=testing_sheet_id,
+        )
+
+        # Try to get worksheet, create if doesn't exist
+        try:
+            ws = testing_client.get_sheet(testing_ws_name)
+        except Exception:
+            print(f"Worksheet '{testing_ws_name}' not found, creating it...")
+            ws = testing_client.spreadsheet.add_worksheet(title=testing_ws_name, rows=1000, cols=20)
+            print(f"Created worksheet '{testing_ws_name}'")
+
+        existing = ws.get_all_values()
+
+        # Add headers if sheet is empty
+        if not any(cell for r in existing for cell in r):
+            headers = [
+                "scraped_at", "profile_url", "author", "post_content", "timestamp",
+                "likes", "reposts", "replies", "bookmarks", "views",
+                "llm_decision", "llm_reason", "prompt_used",
+                "reply_recommendation", "post_link", "question_recommendation"
+            ]
+            ws.append_row(headers, value_input_option="USER_ENTERED")
+            existing = ws.get_all_values()
+        else:
+            headers = existing[0] if existing else []
+            if "question_recommendation" not in headers:
+                headers = list(headers) + ["question_recommendation"]
+                ws.update("A1", [headers])
+
+        # Build deduplication set
+        existing_keys = set()
+        for row in existing[1:]:
+            if len(row) >= 4:  # profile_url, author, post_content, timestamp
+                key = (row[1].strip(), row[2].strip(), row[3].strip())
+                existing_keys.add(key)
+
+        # Prepare rows
+        rows = []
+        scraped_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %I:%M %p")
+
+        for item in all_posts_data:
+            post = item["post"]
+            profile_url = (item.get("profile_url") or "").strip()
+            text = (post.get("text") or post.get("postText") or "").replace("\n", " ").strip()
+            author = post.get("author", {}).get("userName", "")
+
+            # Check for duplicates
+            key = (profile_url, author, text)
+            if key in existing_keys:
+                continue
+
+            ts_raw = item.get("timestamp") or post.get("timestamp") or ""
+            created_at = post.get("createdAt") or ""
+            ts_human = format_timestamp(ts_raw, created_at)
+            post_id = item.get("post_id", "") or post.get("id", "") or post.get("postId", "")
+            post_link = (
+                post.get("postUrl")
+                or post.get("url")
+                or (f"https://x.com/i/web/status/{post_id}" if post_id else "")
+            )
+
+            # Engagement metrics
+            likes = post.get("likes", 0)
+            reposts = post.get("retweetCount", 0)
+            replies_count = post.get("replyCount", 0)
+            bookmarks = post.get("bookmarkCount", 0)
+            views = post.get("viewCount", 0)
+
+            # LLM decision data
+            llm_decision = item.get("llm_decision", "")
+            llm_reason = item.get("llm_reason", "")
+            prompt_used = item.get("prompt_used", "match_prompt")
+            reply_reco = item.get("reply_reco", "")
+            question_reco = item.get("question_reco", "")
+
+            rows.append([
+                scraped_at, profile_url, author, text, ts_human,
+                likes, reposts, replies_count, bookmarks, views,
+                llm_decision, llm_reason, prompt_used,
+                reply_reco, post_link, question_reco
+            ])
+
+        # Write rows
+        if rows:
+            ws.append_rows(rows, value_input_option="USER_ENTERED", table_range="A1")
+            print(f"Wrote {len(rows)} rows to testing sheet '{testing_ws_name}'.")
+            return len(rows)
+        else:
+            print(f"No new rows to write to testing sheet (all duplicates).")
+            return 0
+
+    except Exception as exc:
+        print(f"Failed to write to testing sheet: {exc}")
+        return 0
 
 
 def run_scrape_and_filter() -> List[Dict[str, Any]]:
@@ -409,7 +829,13 @@ def run_scrape_and_filter() -> List[Dict[str, Any]]:
         List of matched post dictionaries.
     """
     load_env()
-    sheet_client = GoogleSheetsClient(spreadsheet_name=os.getenv("GOOGLE_SPREADSHEET_NAME", "Automation Config"))
+    
+    # Use unified GOOGLE_SHEET_ID with fallback to legacy env vars
+    sheet_id = os.getenv("GOOGLE_SHEET_ID") or os.getenv("GOOGLE_X_ACCOUNT_ID")
+    sheet_client = GoogleSheetsClient(
+        spreadsheet_name=os.getenv("GOOGLE_SPREADSHEET_NAME", "Automation Config"),
+        spreadsheet_id=sheet_id,
+    )
     profile_urls = get_profile_urls(sheet_client)
     max_profiles = int(os.getenv("MAX_PROFILE_URLS", "0") or 0)
     batch_start = int(os.getenv("PROFILE_BATCH_START", "0") or 0)
@@ -442,40 +868,174 @@ def run_scrape_and_filter() -> List[Dict[str, Any]]:
         "You craft concise, human replies for a professional liquid fund account. "
         "Read the user's post and propose a short, friendly reply that adds value, "
         "acknowledges the topic, and avoids hype. Use relevant domain knowledge if helpful. "
+        "Feel free to ask questions if the user seem to have deeper insights into the topic. "
         "Keep it under 100 words (aim for brevity). "
-        "Do not include placeholders or ask for more info. Return only the reply text.",
+        "Do not include hyphens/dashes/— or ask for more info. Return only the reply text.",
     )
+    question_prompt = prompt_map.get(
+        "question_prompt",
+        "Write one concise, natural question to ask the author. It should be relevant and invite clarification "
+        "or deeper insight. Return only the question text.",
+    )
+    summary_prompt = prompt_map.get(
+        "summary_prompt",
+        "You are a professional financial analyst creating concise crypto/blockchain post summaries. "
+        "Read the post and generate a single headline (10-15 words max) capturing the key insight. "
+        'Focus on: specific token names, price levels/predictions, technical analysis findings, industry developments, '
+        'or market sentiment shifts. Be specific and actionable. '
+        'Examples: "BTC breaks $45K resistance with strong volume confirmation" or '
+        '"Ethereum staking yields drop to 3.2% amid validator surge". '
+        "Return ONLY the headline, no quotes or extra text.",
+    )
+    category_prompt = prompt_map.get(
+        "category_prompt",
+        'Classify this crypto/blockchain post into ONE category based on PRIMARY focus: '
+        '1) "token_analysis" - specific token price analysis, charts, technical indicators, price predictions, support/resistance levels '
+        '2) "industry_analysis" - broader blockchain industry trends, regulations, institutional adoption, protocol developments, sector-wide movements '
+        '3) "market_comment" - general market sentiment, macro trends, market psychology, fear/greed indicators, overall market conditions '
+        '4) "tokenomic_comment" - tokenomics analysis, token utility, emission schedules, staking mechanisms, token supply dynamics '
+        '5) "others" - news announcements, educational content, or posts that don\'t fit above categories. '
+        "Respond with ONLY the category name exactly as shown in quotes.",
+    )
+
+    rag_index = None
+    if os.getenv("ENABLE_RAG", "true").lower() == "true":
+        try:
+            from x_auto.rag import load_rag_index
+            rag_index = load_rag_index()
+            if rag_index:
+                print("[RAG] Index loaded. Reply generation will use retrieval when relevant.")
+            else:
+                print("[RAG] No index available. Reply generation will use the base prompt.")
+        except Exception as exc:
+            print(f"[RAG] Initialization failed, continuing without RAG: {exc}")
 
     matched: List[Dict[str, Any]] = []
     matched_with_profile: List[Dict[str, Any]] = []
+    all_posts_with_decisions: List[Dict[str, Any]] = []  # NEW: Track ALL posts with LLM decisions
     total_posts = 0
     recent_posts = 0
     reply_posts = 0
     post_limit = int(os.getenv("POST_RESULTS_LIMIT", "5") or 5)
-    for idx, url in enumerate(profile_urls, start=1):
-        print(f"[{idx}/{len(profile_urls)}] Fetching posts for {url}")
-        posts = fetch_posts([url], results_limit=post_limit)
+    lookback_days = int(os.getenv("LOOKBACK_DAYS", "30") or 30)
+
+    # Calculate date range for filtering
+    from datetime import datetime, timedelta, timezone
+    end_date = datetime.now(tz=timezone.utc)
+    start_date = end_date - timedelta(days=lookback_days)
+    start_date_str = start_date.strftime("%Y-%m-%d")
+    end_date_str = end_date.strftime("%Y-%m-%d")
+
+    # Extract handles from profile URLs for batch fetching
+    handles = []
+    url_to_handle = {}
+    for url in profile_urls:
+        # Extract handle from URL like https://x.com/username
+        handle = url.rstrip('/').split('/')[-1]
+        handles.append(handle)
+        url_to_handle[handle] = url
+
+    # Batch fetch all posts at once with date filter (much faster and more efficient!)
+    print(f"\nBatch fetching posts for {len(handles)} profiles...")
+    print(f"Date range: {start_date_str} to {end_date_str} ({lookback_days} day(s))")
+    print(f"Handles: {', '.join(handles[:5])}{'...' if len(handles) > 5 else ''}")
+
+    all_posts = fetch_posts(
+        handles,
+        max_items=post_limit * len(handles),
+        start_date=start_date_str,
+        end_date=end_date_str
+    )
+    print(f"Fetched {len(all_posts)} posts within date range from batch query")
+
+    # Group posts by author for processing
+    posts_by_handle: Dict[str, List[Dict[str, Any]]] = {}
+    for post in all_posts:
+        author_handle = post.get("author", {}).get("userName", "")
+        if author_handle:
+            posts_by_handle.setdefault(author_handle, []).append(post)
+
+    # Process each profile's posts
+    # Note: Apify API date filters may not work as expected, so we filter again here
+    for idx, handle in enumerate(handles, start=1):
+        url = url_to_handle[handle]
+        posts = posts_by_handle.get(handle, [])
+
+        print(f"[{idx}/{len(handles)}] Fetched {len(posts)} posts for {url}")
         total_posts += len(posts)
-        lookback_days = int(os.getenv("LOOKBACK_DAYS", "30") or 30)
+
+        # Filter by date (in case API didn't filter correctly)
         recent = [p for p in posts if is_recent_post(p, days=lookback_days)]
+        print(f"   → {len(recent)} posts within last {lookback_days} day(s)")
         recent_posts += len(recent)
+
+        if not recent:
+            continue  # Skip if no recent posts
+
+        # Filter out replies and simple retweets (safety net for API-level filtering)
         replies = [p for p in recent if is_reply(p)]
         reply_posts += len(replies)
-        # Merge by conversation id and 2-minute window; include originals if no replies found.
-        to_merge = replies if replies else recent
+        retweets = [p for p in recent if is_retweet(p)]
+
+        # Combine filters - exclude both replies and retweets
+        filtered_posts = [p for p in recent if not is_reply(p) and not is_retweet(p)]
+        print(f"   → {len(filtered_posts)} posts after filtering out replies and retweets")
+
+        # Merge by conversation id and 2-minute window
+        to_merge = filtered_posts if filtered_posts else recent
         merged_recent = merge_threaded_posts(to_merge)
         for post in merged_recent:
             text = post.get("text") or post.get("postText") or ""
             if not text:
                 continue
-            if is_match_via_llm(base_prompt, text):
+
+            # Get LLM decision with reason
+            llm_result = get_llm_decision_with_reason(base_prompt, text)
+            is_match = llm_result["decision"]
+
+            # Generate reply recommendation, question, summary, and category only for matched posts
+            recommendation = ""
+            question = ""
+            summary = ""
+            category = "others"
+            if is_match:
+                recommendation = generate_reply_recommendation(
+                    text,
+                    prompt=reply_prompt,
+                    rag_index=rag_index,
+                )
+                question = generate_question_recommendation(
+                    text,
+                    prompt=question_prompt,
+                    rag_index=rag_index,
+                )
+                summary = generate_post_summary(text, prompt=summary_prompt)
+                category = categorize_post(text, prompt=category_prompt)
+
+            # Add to all_posts_with_decisions (for testing sheet)
+            all_posts_with_decisions.append({
+                "profile_url": url,
+                "post": post,
+                "llm_decision": llm_result["decision_text"],
+                "llm_reason": llm_result["reason"],
+                "prompt_used": "match_prompt",
+                "reply_reco": recommendation,
+                "question_reco": question,
+                "post_id": post.get("id") or post.get("postId") or "",
+                "timestamp": post.get("timestamp"),
+            })
+
+            # Add to matched lists only if LLM says yes (for output sheet)
+            if is_match:
                 matched.append(post)
-                recommendation = generate_reply_recommendation(text, prompt=reply_prompt)
                 matched_with_profile.append(
                     {
                         "profile_url": url,
                         "post": post,
                         "reply_reco": recommendation,
+                        "question_reco": question,
+                        "summary": summary,
+                        "category": category,
                         "post_id": post.get("id") or post.get("postId") or "",
                         "timestamp": post.get("timestamp"),
                     }
@@ -483,7 +1043,7 @@ def run_scrape_and_filter() -> List[Dict[str, Any]]:
 
     # For now, print a simple summary and return the matches for caller use.
     print(f"Total posts fetched: {total_posts}")
-    print(f"Posts within last 30 days: {recent_posts}")
+    print(f"Posts within last {lookback_days} day(s): {recent_posts}")
     print(f"Replies considered (<=2 min merge per author): {reply_posts}")
     print(f"Matched (LLM yes) posts: {len(matched)}")
     for idx, post in enumerate(matched, 1):
@@ -491,9 +1051,16 @@ def run_scrape_and_filter() -> List[Dict[str, Any]]:
         preview = (post.get("text") or post.get("postText") or "")[:140].replace("\n", " ")
         print(f"{idx}. {pid}: {preview!r}")
 
-    # Persist matches to output sheet if configured.
-    output_sheet_id = os.getenv("GOOGLE_X_SCRAPE_OUTPUT")
-    output_ws_name = os.getenv("GOOGLE_X_SCRAPE_OUTPUT_WORKSHEET", "scrape_output")
+    # Write ALL posts (including rejected ones) to testing sheet for analysis
+    if all_posts_with_decisions:
+        print(f"\nWriting {len(all_posts_with_decisions)} posts to testing sheet (all_post)...")
+        testing_count = write_all_posts_to_testing_sheet(all_posts_with_decisions)
+        print(f"Testing sheet write complete: {testing_count} rows")
+
+    # Persist matches to scraped_output worksheet (llm_decision=yes posts)
+    # New env var with fallback to legacy
+    output_sheet_id = os.getenv("GOOGLE_SHEET_ID") or os.getenv("GOOGLE_X_SCRAPE_OUTPUT")
+    output_ws_name = os.getenv("GOOGLE_WS_SCRAPED_OUTPUT") or os.getenv("GOOGLE_X_SCRAPE_OUTPUT_WORKSHEET", "scraped_output")
     if output_sheet_id and matched_with_profile:
         try:
             out_client = GoogleSheetsClient(
@@ -512,10 +1079,19 @@ def run_scrape_and_filter() -> List[Dict[str, Any]]:
 
             if not any(cell for r in existing for cell in r):
                 ws.append_row(
-                    ["profile_url", "post_content", "timestamp_ms", "reply_recommendation", "post_link"],
+                    ["profile_url", "post_content", "timestamp", "likes", "reposts", "replies", "bookmarks", "views",
+                     "author", "reply_recommendation", "question_recommendation", "post_link", "summary", "category",
+                     "telegram_sent_at"],
                     value_input_option="USER_ENTERED",
                 )
                 existing = ws.get_all_values()
+            else:
+                headers = existing[0] if existing else []
+                if "question_recommendation" not in headers:
+                    headers = list(headers)
+                    insert_at = headers.index("reply_recommendation") + 1 if "reply_recommendation" in headers else len(headers)
+                    headers.insert(insert_at, "question_recommendation")
+                    ws.update("A1", [headers])
 
             existing_pairs = set()
             for row in existing[1:]:
@@ -528,24 +1104,55 @@ def run_scrape_and_filter() -> List[Dict[str, Any]]:
                 profile_url = (item["profile_url"] or "").strip()
                 text = (post.get("text") or post.get("postText") or "").replace("\n", " ").strip()
                 reply_reco = item.get("reply_reco", "")
-                ts_raw = item.get("timestamp") or ""
+                question_reco = item.get("question_reco", "")
+                summary = item.get("summary", "")
+                category = item.get("category", "others")
+                ts_raw = item.get("timestamp") or post.get("timestamp") or ""
+                created_at = post.get("createdAt") or ""
                 ts_str = str(ts_raw) if ts_raw is not None else ""
-                ts_human = format_timestamp(ts_raw)
+                ts_human = format_timestamp(ts_raw, created_at)
                 post_id = item.get("post_id", "")
                 post_link = (
                     post.get("postUrl")
                     or post.get("url")
                     or (f"https://x.com/i/web/status/{post_id}" if post_id else "")
                 )
+
+                # Extract engagement metrics and author
+                likes = post.get("likes", 0)
+                reposts = post.get("retweetCount", 0)
+                replies = post.get("replyCount", 0)
+                bookmarks = post.get("bookmarkCount", 0)
+                views = post.get("viewCount", 0)
+                author = post.get("author", {}).get("userName", "")
+
                 key = (profile_url, text, ts_str)
                 if key in existing_pairs:
                     continue
-                rows.append([profile_url, text, ts_human, reply_reco, post_link])
+                rows.append([profile_url, text, ts_human, likes, reposts, replies, bookmarks, views,
+                            author, reply_reco, question_reco, post_link, summary, category, ""])
             if rows:
                 ws.append_rows(rows, value_input_option="USER_ENTERED", table_range="A1")
             print(f"Wrote {len(rows)} rows to output sheet '{output_ws_name}'.")
         except Exception as exc:  # noqa: BLE001
             print(f"Failed to write scrape output: {exc}")
+
+    # Send Telegram notification with categorized summaries
+    if os.getenv("ENABLE_TELEGRAM_NOTIFICATIONS", "true").lower() == "true":
+        try:
+            from x_auto.notifications.telegram_bot import send_daily_summary
+            print(f"\n[Telegram] Sending daily summary with {len(matched_with_profile)} posts...")
+            success = send_daily_summary(matched_with_profile)
+            if success:
+                print("[Telegram] Notification sent successfully")
+            else:
+                print("[Telegram] Failed to send notification (see logs above)")
+        except Exception as e:
+            import logging
+            logging.error(f"Telegram notification failed: {e}", exc_info=True)
+            print(f"[Telegram] Error: {e}")
+            # Don't fail the entire job if Telegram fails
+
     return matched
 
 

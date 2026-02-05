@@ -12,7 +12,7 @@ from __future__ import annotations
 import os
 from typing import Any, Dict, List
 
-from scrapers.apify_client import fetch_posts
+from x_auto.scrapers.apify_client import fetch_posts
 
 from x_auto.matcher.keyword_matcher import match_keywords, score_matches
 from x_auto.reply_engine.reply_generator import build_reply_text, select_best_template
@@ -38,8 +38,10 @@ def run_pipeline() -> None:
         This function focuses on orchestration; several utilities are intentionally
         left as stubs for future implementation.
     """
+    # Use unified GOOGLE_SHEET_ID with fallback to legacy env vars
+    sheet_id = os.getenv("GOOGLE_SHEET_ID") or os.getenv("GOOGLE_X_ACCOUNT_ID")
     spreadsheet_name = os.getenv("GOOGLE_SPREADSHEET_NAME", "Automation Config")
-    sheet_client = GoogleSheetsClient(spreadsheet_name=spreadsheet_name)
+    sheet_client = GoogleSheetsClient(spreadsheet_name=spreadsheet_name, spreadsheet_id=sheet_id)
     enable_posting = os.getenv("ENABLE_X_POSTING", "false").lower() == "true"
 
     profile_rows = sheet_client.read_records("profiles")
@@ -77,17 +79,52 @@ def run_pipeline() -> None:
 
 # Placeholder utilities with docstrings for future implementation ----------------
 
-def filter_already_processed(posts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def filter_already_processed(
+    posts: List[Dict[str, Any]],
+    sheet_client: GoogleSheetsClient | None = None,
+    output_sheet_name: str | None = None
+) -> List[Dict[str, Any]]:
     """
-    Placeholder for ID tracking to skip posts that were already handled.
+    Filter out posts that have already been processed by checking the output sheet.
 
     Args:
         posts: Raw posts returned by Apify.
+        sheet_client: Optional GoogleSheetsClient instance. If None, creates a new one.
+        output_sheet_name: Optional worksheet name. If None, uses GOOGLE_WS_SCRAPED_OUTPUT.
 
     Returns:
         A filtered list containing only new/unprocessed posts.
     """
-    raise NotImplementedError("Implement ID tracking to filter already processed posts.")
+    if not posts:
+        return []
+
+    # Get or create sheet client (新版整合 + 向後相容)
+    if sheet_client is None:
+        output_sheet_id = os.getenv("GOOGLE_SHEET_ID") or os.getenv("GOOGLE_X_SCRAPE_OUTPUT")
+        if not output_sheet_id:
+            # If no output sheet configured, return all posts (no filtering)
+            return posts
+        sheet_client = GoogleSheetsClient(
+            spreadsheet_name="Scrape Output",
+            spreadsheet_id=output_sheet_id
+        )
+
+    # Get worksheet name (新版整合 + 向後相容)
+    if output_sheet_name is None:
+        output_sheet_name = os.getenv("GOOGLE_WS_SCRAPED_OUTPUT") or os.getenv("GOOGLE_X_SCRAPE_OUTPUT_WORKSHEET", "scraped_output")
+
+    # Fetch existing post IDs from the output sheet
+    try:
+        existing_records = sheet_client.read_records(output_sheet_name)
+        existing_post_ids = {record.get("post_id", "") for record in existing_records if record.get("post_id")}
+    except Exception:
+        # If sheet doesn't exist or is empty, assume no posts have been processed
+        existing_post_ids = set()
+
+    # Filter posts
+    new_posts = [post for post in posts if post.get("id", "") not in existing_post_ids]
+
+    return new_posts
 
 
 def format_log_row(post: Dict[str, Any], reply_text: str, response: Dict[str, Any]) -> List[Any]:
